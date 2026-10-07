@@ -150,6 +150,11 @@ export default function ExamPaperEditor({
   const [imageUploadingSlot, setImageUploadingSlot] = useState<number | null>(null);
   const [detectWarnings, setDetectWarnings] = useState<Record<number, string[]>>({});
   const [detectExistingMap, setDetectExistingMap] = useState<Record<number, boolean>>({});
+  // True right after "Remove All" — suppresses empty-slot reseeding so the
+  // page stays in a truly empty detection state until the next Detect /
+  // Refresh / workspace switch. Without this, the drafts-seeding effect
+  // repopulates totalSlots empty drafts and Q01..QNN cards reappear.
+  const [detectionCleared, setDetectionCleared] = useState(false);
   // ── Separate Answer Key workflow (per version/set workspace, like bulkTexts) ──
   // "included" = existing combined Question+Answer detection (default, unchanged).
   // "separate" = detect questions only, then detect/paste a standalone key and Apply by question number.
@@ -236,6 +241,7 @@ export default function ExamPaperEditor({
   useEffect(() => {
     setQuestions(null);
     setDrafts({});
+    setDetectionCleared(false);
     setDetectWarnings({});
     setDetectExistingMap({});
     setSavingSlot(null);
@@ -269,12 +275,14 @@ export default function ExamPaperEditor({
   // preview shows all, even if exam was configured for 10. Extra slots are
   // kept as unsaved drafts and auto-created on Save via resolveOrCreateSlot.
   const effectiveTotalSlots = useMemo(() => {
+    if (detectionCleared) return 0;
     const draftMax = Object.keys(drafts).length ? Math.max(...Object.keys(drafts).map(Number)) + 1 : 0;
     const qLen = questions?.length ?? 0;
     return Math.max(totalSlots, draftMax, qLen);
-  }, [totalSlots, drafts, questions]);
+  }, [totalSlots, drafts, questions, detectionCleared]);
 
   const displaySlots = useMemo(() => {
+    if (detectionCleared) return [];
     if (!questions) return [];
     const effective = effectiveTotalSlots;
     const list: Array<{ index: number; q: ExamQuestion | null }> = [];
@@ -296,7 +304,8 @@ export default function ExamPaperEditor({
   useEffect(() => {
     // Seed drafts from saved questions when they load (never overwrite edits in progress)
     // Keep detected drafts beyond totalSlots (effective) — don't prune, so 20/50/100 all show.
-    if (!questions) return;
+    // Skipped entirely after "Remove All" so cleared slots never repopulate.
+    if (!questions || detectionCleared) return;
     setDrafts((prev) => {
       const merged: Record<number, SlotDraft> = { ...prev };
       for (let i = 0; i < totalSlots; i++) {
@@ -330,6 +339,7 @@ export default function ExamPaperEditor({
   async function handleDetect() {
     setError(null);
     setNotice(null);
+    setDetectionCleared(false);
     setDetectWarnings({});
     setDetectExistingMap({});
     // Capture workspace at call time for the status message below.
@@ -807,11 +817,15 @@ export default function ExamPaperEditor({
    */
   function handleRemoveAll() {
     if (!window.confirm("Remove all detected questions?")) return;
+    // Invalidate any in-flight load()/refresh so saved rows can't repopulate the cleared view.
+    loadVersionRef.current += 1;
     setError(null);
+    setDetectionCleared(true);
     setDetectWarnings({});
     setDetectExistingMap({});
     setDrafts({});
     setBulkTexts((prev) => ({ ...prev, [activeTab]: "" }));
+    setAnswerKeyTexts((prev) => ({ ...prev, [activeTab]: "" }));
     setAnswerKeyMaps((prev) => ({ ...prev, [activeTab]: {} }));
     setAnswerKeyDupes((prev) => ({ ...prev, [activeTab]: [] }));
     setAnswerKeyMsg(null);
@@ -877,6 +891,7 @@ export default function ExamPaperEditor({
       if (workspaceRef.current.v !== v || workspaceRef.current.s !== s) return;
       const fresh = data.questions as ExamQuestion[];
       setQuestions(fresh);
+      setDetectionCleared(false);
       const next: Record<number, SlotDraft> = {};
       for (let i = 0; i < totalSlots; i++) {
         next[i] = draftFromQuestion(i < fresh.length ? fresh[i] : null);
@@ -1253,6 +1268,11 @@ export default function ExamPaperEditor({
       <div className={embedded ? "" : "mx-auto max-w-4xl px-3 py-6 sm:px-6"}>
         {questions === null ? (
           <p className={`${cardClass} p-6 text-center text-sm text-slate-500`}>Loading paper…</p>
+        ) : detectionCleared ? (
+          <div className={`${cardClass} p-6 text-center`}>
+            <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">Detection cleared.</p>
+            <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect. Saved questions are untouched — Refresh reloads them.</p>
+          </div>
         ) : totalSlots === 0 ? (
           <div className={`${cardClass} p-6 text-center`}>
             <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">No slots configured.</p>
@@ -1454,6 +1474,11 @@ export default function ExamPaperEditor({
         <div className="mx-auto max-w-4xl px-4 py-6 sm:px-6">
           {questions === null ? (
             <p className={`${cardClass} p-6 text-center text-sm text-slate-500`}>Loading paper…</p>
+          ) : detectionCleared ? (
+            <div className={`${cardClass} p-6 text-center`}>
+              <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">Detection cleared.</p>
+              <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect. Saved questions are untouched — Refresh reloads them.</p>
+            </div>
           ) : totalSlots === 0 ? (
             <div className={`${cardClass} p-6 text-center`}>
               <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">No slots configured.</p>
