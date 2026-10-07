@@ -1314,7 +1314,10 @@ function splitByNumbering(text: string): string[] | null {
     const header = stripQuestionHeader(line);
     const option = parseOptionLine(line, true);
     const style = option ? optionLabelStyle(line) : null;
-    const explicitHeader = header !== null && /^(?:Q|Question|প্রশ্ন)/i.test(header.header);
+    const explicitHeader = header !== null && (
+      /^(?:Q|Question|প্রশ্ন)/i.test(header.header) ||
+      /[।]/.test(header.header)
+    );
     const continuesOptionRun = !afterAnswer && option !== null &&
       style === ambiguousStyle && option.index > lastOptionIndex;
     // Before the options, bare numbered/Roman lines are stem statements.
