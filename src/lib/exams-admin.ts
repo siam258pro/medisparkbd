@@ -1250,6 +1250,59 @@ export async function saveExam(
       } catch {
         // Best effort — slots may be created on next edit.
       }
+      // Total Questions is the paper definition: slots beyond N leave the
+      // paper (content preserved, reactivatable), and leftover empty slots
+      // inside 1..N come back. Nothing is ever deleted, so result history
+      // and authored content always survive a count change.
+      try {
+        await conn.query(
+          `UPDATE exam_questions SET is_active = 0
+            WHERE exam_id = ? AND sort_order > ? AND is_active <> 0`,
+          [id, questionCount],
+        );
+      } catch {
+        // Best effort — surplus stays visible until the next save.
+      }
+      try {
+        const [inRange] = await conn.query(
+          `SELECT q.id FROM exam_questions q
+             LEFT JOIN exam_question_variants v ON v.question_id = q.id
+            WHERE q.exam_id = ? AND q.sort_order <= ? AND q.is_active = 0
+              AND (q.question IS NULL OR q.question = '')
+              AND (q.question_image IS NULL OR q.question_image = '')
+              AND (q.options IS NULL OR q.options = ''
+                   OR q.options = '[]' OR q.options = '["","","",""]')
+            GROUP BY q.id HAVING COUNT(v.question_id) = 0`,
+          [id, questionCount],
+        );
+        const emptyIds = (inRange as unknown as { id: number }[]).map((r) => Number(r.id));
+        if (emptyIds.length > 0) {
+          const ph = emptyIds.map(() => "?").join(",");
+          await conn.query(
+            `UPDATE exam_questions SET is_active = 1 WHERE id IN (${ph})`,
+            emptyIds,
+          );
+        }
+      } catch {
+        // Best effort — empty slots stay hidden until reactivated manually.
+      }
+      // Stored totals follow the live paper so the configured count and the
+      // displayed count can never drift apart again.
+      try {
+        const [totRows] = await conn.query(
+          `SELECT COUNT(*) AS count, SUM(marks) AS marks FROM exam_questions
+            WHERE exam_id = ? AND is_active = 1`,
+          [id],
+        );
+        const tot = (totRows as unknown as { count: number; marks: string | null }[])[0];
+        await conn.query(`UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`, [
+          tot?.count ?? 0,
+          Number(tot?.marks ?? 0) || 0,
+          id,
+        ]);
+      } catch {
+        // Best effort — readers recompute live totals anyway.
+      }
     }
 
     // Keep course assignments in sync (COURSE scope).
