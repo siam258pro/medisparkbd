@@ -228,8 +228,8 @@ Answer: B</pre>
     <button class="copy" onclick="copyText('stemFormat')">📋 ফরম্যাট কপি করুন</button>
     <ul>
       <li>বাড়তি লাইন <b>সাধারণ লাইন বা <code class="inline">- </code> দিয়ে</b> লিখুন — প্রশ্নের সাথেই থাকবে (verified)।</li>
-      <li>Stem-এর ভেতরে <code class="inline">i.</code> <code class="inline">ii.</code> <code class="inline">1.</code> <code class="inline">2.</code> দিয়ে লাইন শুরু করবেন <b>না</b> — এগুলো আলাদা প্রশ্ন ধরা হয়।</li>
-      <li>সমীকরণ সবসময় <b>এক লাইনে</b> রাখুন।</li>
+      <li>অপশনের আগে stem-এর <code class="inline">i.</code> <code class="inline">ii.</code> <code class="inline">1.</code> <code class="inline">2.</code> বিবৃতিগুলো প্রশ্নের সাথেই থাকে। আলাদা প্রশ্নের মাঝে ফাঁকা লাইন রাখুন।</li>
+      <li>সমীকরণ এক বা একাধিক লাইনে রাখা যায় — line break preserved থাকে।</li>
     </ul>
   </div>
 
@@ -255,7 +255,7 @@ Answer: B</pre>
     <button class="copy" onclick="copyText('multiFormat')">📋 ফরম্যাট কপি করুন</button>
     <ul>
       <li>Equation-লাইন <code class="inline">=</code> <code class="inline">→</code> <code class="inline">√</code> <code class="inline">^</code> দিয়ে থাকলে সেটা প্রশ্নের অংশই থাকে।</li>
-      <li>Stem-এর ভেতরে <code class="inline">i.</code> <code class="inline">1.</code> দিয়ে লাইন শুরু করবেন না।</li>
+      <li>অপশনের আগে <code class="inline">i.</code> <code class="inline">1.</code> দিয়ে বিবৃতি লেখা যায় — এগুলো আলাদা প্রশ্ন নয়।</li>
       <li>Formatter-এ <b>multi-line equation রাখুন</b> টিক থাকলে output-এ লাইন-ব্রেক preserved থাকে।</li>
     </ul>
   </div>
@@ -433,8 +433,8 @@ Answer: A</pre>
     <button class="copy" onclick="copyText('stemFormatEn')">📋 Copy format</button>
     <ul>
       <li>Write extra lines as <b>plain lines or with <code class="inline">- </code></b> — they stay with the question (verified).</li>
-      <li>Do <b>not</b> start a line inside the stem with <code class="inline">i.</code> <code class="inline">ii.</code> <code class="inline">1.</code> <code class="inline">2.</code> — those are detected as new questions.</li>
-      <li>Always keep equations on <b>one line</b>.</li>
+      <li>Statement lines starting with <code class="inline">i.</code> <code class="inline">ii.</code> <code class="inline">1.</code> <code class="inline">2.</code> before the options stay in the stem. Leave a blank line between separate questions.</li>
+      <li>Equations may span multiple lines — line breaks are preserved.</li>
     </ul>
   </div>
 

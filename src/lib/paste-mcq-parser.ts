@@ -949,19 +949,20 @@ function injectNewlinesForInline(text: string): string {
   // Every rule below carries the NOT_IN_ANSWER_LINE guard AFTER its lookahead
   // (needs the `m` flag so `^` anchors at line starts).
   s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[A-Da-d]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])\\s+(?=\\([A-Da-d]\\)\\s*[\\.\\)\\:\\-]?)${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([A-Da-d]\\)\\s*[\\.\\)\\:\\-]?)${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
   s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[কখগঘ]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])\\s+(?=\\([কখগঘ]\\))${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])\\s{2,}(?=[1-4]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])\\s{2,}(?=[১-৪]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([কখগঘ]\\))${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\[[A-Da-dকখগঘ]\\])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[1-4]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[১-৪]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
   // Roman inline
-  s = s.replace(new RegExp(`([^\\n])\\s{2,}(?=(?:i{1,3}|iv)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])\\s{2,}(?=(?:I{1,3}|IV)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=(?:i{1,3}|iv)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=(?:I{1,3}|IV)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
   // Answer inline: handle multi-word prefixes first, then single-word with lookbehind to avoid splitting "Correct Answer" inside
-  s = s.replace(/([^\n])\s+(?=(?:Correct\s+Answer|Correct\s+option|সঠিক\s+উত্তর)\s*[:\-=—ঃ.:])/gi, "$1\n");
-  s = s.replace(/([^\n])\s+(?<!Correct\s)(?<!সঠিক\s)(?=(?:Ans(?:wer)?\.?|Correct|উত্তর\s*ঃ?)\s*[:\-=—ঃ.:])/gi, "$1\n");
+  s = s.replace(/([^\n])[ \t]+(?=(?:Correct\s+Answer|Correct\s+option|সঠিক\s+উত্তর)\s*[:\-=—ঃ.:])/gi, "$1\n");
+  s = s.replace(/([^\n])[ \t]+(?<!Correct\s)(?<!সঠিক\s)(?=(?:Ans(?:wer)?\.?|Correct|উত্তর\s*ঃ?)\s*[:\-=—ঃ.:])/gi, "$1\n");
   // Explanation inline: ব্যাখ্যা: / Explanation:
-  s = s.replace(/([^\n])\s+(?=(?:ব্যাখ্যা\s*ঃ?|Explanation|Explan\.?)\s*[:\-=—ঃ])/gi, "$1\n");
+  s = s.replace(/([^\n])[ \t]+(?=(?:ব্যাখ্যা\s*ঃ?|Explanation|Explan\.?)\s*[:\-=—ঃ])/gi, "$1\n");
   // A number inside a stem/header is not a new question. Only split an
   // inline header after an answer, and never let whitespace span newlines.
   s = s.replace(/[ \t]+(?=(?:Q[ \t]*[.\-]?[ \t]*[0-9০-৯]+[ \t]*[.):\-।]|Question[ \t]*(?:No\.?)?[ \t]*[0-9০-৯]+[ \t]*[.):\-]|প্রশ্ন[ \t]*(?:নং\.?)?[ \t]*[0-9০-৯]+[ \t]*[.):\-।]|[0-9০-৯]+[ \t]*[.)।][ \t]+[^\n]{3,}|[IVXLCDM]+[.)][ \t]+\S))/gi,
@@ -1350,7 +1351,10 @@ function splitByNumbering(text: string): string[] | null {
     // Before the options, bare numbered/Roman lines are stem statements.
     // After the options, a fresh header starts the next question unless it is
     // still part of the active numeric/Roman option group.
-    if (header && (start < 0 || explicitHeader || ((seenOptions || afterAnswer) && !continuesOptionRun))) {
+    if (start < 0 && header && lines.slice(0, i).some((l) => l.trim())) return null;
+    const separatedHeader = header !== null && !seenOptions && i > start + 1 &&
+      !lines[i - 1].trim() && !isAmbiguousOptionRun(lines, i);
+    if (header && (start < 0 || explicitHeader || separatedHeader || ((seenOptions || afterAnswer) && !continuesOptionRun))) {
       if (start >= 0) blocks.push(lines.slice(start, i).join("\n").trim());
       start = i;
       seenOptions = false;
