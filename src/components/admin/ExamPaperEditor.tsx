@@ -819,10 +819,12 @@ export default function ExamPaperEditor({
     setSaveAllBusy(true);
     setSaveProgress({ done: 0, total: items.length });
     try {
-      // One bulk request per 200 items (server batch cap) to existing storage.
+      // Small chunks (25) so the progress bar visibly advances on every
+      // save — one giant request would sit at 0% until the very end.
+      // (Server batch cap is 200; staying far below keeps each request fast.)
       let saved = 0;
-      for (let start = 0; start < items.length; start += 200) {
-        const chunk = items.slice(start, start + 200);
+      for (let start = 0; start < items.length; start += 25) {
+        const chunk = items.slice(start, start + 25);
          
         const res = await fetch("/api/admin/exams/questions", {
           method: "POST",
