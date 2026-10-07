@@ -1,4 +1,4 @@
-import { ensureColumn, exec, parseJsonColumn, query } from "@/lib/mysql";
+import { ensureColumn, exec, parseJsonColumn, query, withTransaction } from "@/lib/mysql";
 
 // ── Bilingual Exam Set Auto-Sync ────────────────────────────────────────────
 // CORE RULE: Bangla rows in `exam_questions` are the SINGLE SOURCE OF TRUTH.
@@ -13,6 +13,7 @@ import {
   SYNC_SETS,
   SYNC_TOPICS,
   TOPIC_REQUIRED_COUNT,
+  correctIndexToLetter,
 } from "./exam-autosync-pure";
 export type { Difficulty, SyncLang, SyncSet, SyncTopic, TranslationStatus } from "./exam-autosync-pure";
 export {
@@ -67,21 +68,15 @@ export function ensureAutoSyncTables(): Promise<void> {
           REFERENCES exam_questions(id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
       // Master-record extensions on exam_questions (all nullable/additive).
-      try {
-        await ensureColumn("exam_questions", "set_label", "`set_label` ENUM('A','B') NULL AFTER exam_id");
-      } catch {}
-      try {
-        await ensureColumn("exam_questions", "topic", "`topic` VARCHAR(64) NULL AFTER bank_subject");
-      } catch {}
-      try {
-        await ensureColumn("exam_questions", "difficulty", "`difficulty` ENUM('Easy','Moderate','Hard') NULL DEFAULT NULL AFTER explanation");
-      } catch {}
-      try {
-        await ensureColumn("exam_questions", "question_uid", "`question_uid` VARCHAR(32) NULL AFTER id");
-      } catch {}
+      await ensureColumn("exam_questions", "set_label", "`set_label` ENUM('A','B') NULL AFTER exam_id");
+      await ensureColumn("exam_questions", "topic", "`topic` VARCHAR(64) NULL AFTER bank_subject");
+      await ensureColumn("exam_questions", "difficulty", "`difficulty` ENUM('Easy','Moderate','Hard') NULL DEFAULT NULL AFTER explanation");
+      await ensureColumn("exam_questions", "question_uid", "`question_uid` VARCHAR(32) NULL AFTER id");
       try {
         await exec(`CREATE UNIQUE INDEX uq_exam_questions_uid ON exam_questions(question_uid)`);
-      } catch {}
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ER_DUP_KEYNAME") throw error;
+      }
     })().catch((e) => {
       ready = null;
       throw e;
@@ -113,6 +108,8 @@ export async function allocateQuestionUid(): Promise<string> {
   await ensureAutoSyncTables();
   const rows = await query<{ question_uid: string | null }[]>(
     `SELECT question_uid FROM exam_questions WHERE question_uid IS NOT NULL`,
+    [],
+    { cache: false },
   );
   const existing = new Set(rows.map((r) => String(r.question_uid)));
   let max = 0;
@@ -196,60 +193,63 @@ export type TranslationRow = {
 export async function fetchTranslations(examId: string, set: SyncSet): Promise<Map<number, TranslationRow>> {
   await ensureAutoSyncTables();
   const map = new Map<number, TranslationRow>();
-  try {
-    const rows = await query<TranslationRow[]>(
-      `SELECT t.question_id, t.question_uid, t.language, t.question_text, t.option_a,
-              t.option_b, t.option_c, t.option_d, t.explanation, t.translation_status
-         FROM question_translations t
-         JOIN exam_questions q ON q.id = t.question_id
-        WHERE q.exam_id = ? AND q.set_label = ? AND t.language = 'en'`,
-      [examId, set],
-    );
-    for (const r of rows) map.set(Number(r.question_id), r);
-  } catch {}
+  const rows = await query<TranslationRow[]>(
+    `SELECT t.question_id, t.question_uid, t.language, t.question_text, t.option_a,
+            t.option_b, t.option_c, t.option_d, t.explanation, t.translation_status
+       FROM question_translations t
+       JOIN exam_questions q ON q.id = t.question_id
+      WHERE q.exam_id = ? AND q.set_label = ? AND q.is_active = 1 AND t.language = 'en'`,
+    [examId, set],
+  );
+  for (const r of rows) map.set(Number(r.question_id), r);
   return map;
 }
 
-/** (Re)generate the cached English translation for one master row. */
-export async function syncTranslationFor(questionId: number): Promise<TranslationStatus> {
+/** Automatic sync preserves manual wording; only explicit regeneration replaces it. */
+export async function syncTranslationFor(questionId: number, regenerate = false): Promise<TranslationStatus> {
+  if (!Number.isSafeInteger(questionId) || questionId <= 0) return "failed";
   await ensureAutoSyncTables();
-  const rows = await query<MasterRow[]>(
-    `SELECT id, question_uid, options, question, explanation FROM exam_questions WHERE id = ? LIMIT 1`,
-    [questionId],
-  );
-  const row = rows[0];
-  if (!row) return "failed";
-  const [a, b, c, d] = masterRowToOptions(row);
   try {
-    await exec(
-      `INSERT INTO question_translations
-         (question_id, question_uid, language, question_text, option_a, option_b, option_c, option_d, explanation, translation_status, translated_at)
-       VALUES (?, ?, 'en', ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)
-       ON DUPLICATE KEY UPDATE question_uid = VALUES(question_uid), question_text = VALUES(question_text),
-         option_a = VALUES(option_a), option_b = VALUES(option_b), option_c = VALUES(option_c),
-         option_d = VALUES(option_d), explanation = VALUES(explanation),
-         translation_status = IF(translation_status = 'manually_edited', 'manually_edited', 'completed'),
-         translated_at = CURRENT_TIMESTAMP`,
-      [
-        row.id, row.question_uid ?? null,
-        autoTranslateBnToEn(row.question), autoTranslateBnToEn(a),
-        autoTranslateBnToEn(b), autoTranslateBnToEn(c), autoTranslateBnToEn(d),
-        row.explanation ? autoTranslateBnToEn(row.explanation) : null,
-      ],
-    );
-    const check = await query<{ translation_status: TranslationStatus }[]>(
-      `SELECT translation_status FROM question_translations WHERE question_id = ? AND language = 'en' LIMIT 1`,
-      [row.id],
-    );
-    return check[0]?.translation_status ?? "completed";
+    return await withTransaction(async (connection) => {
+      // Serialize source edits with translation generation; never cache this read.
+      const [masters] = await connection.query(
+        `SELECT id, question_uid, options, question, explanation FROM exam_questions
+          WHERE id = ? AND is_active = 1 FOR UPDATE`,
+        [questionId],
+      );
+      const row = (masters as MasterRow[])[0];
+      if (!row) return "failed";
+      const [translations] = await connection.query(
+        `SELECT translation_status FROM question_translations WHERE question_id = ? AND language = 'en' FOR UPDATE`,
+        [questionId],
+      );
+      const status = (translations as { translation_status: TranslationStatus }[])[0]?.translation_status;
+      if (status === "manually_edited" && !regenerate) return status;
+      const options = parseJsonColumn<unknown[]>(row.options);
+      if (!row.question.trim() || !Array.isArray(options) || options.length !== 4
+        || options.some((o) => typeof o !== "string" || !o.trim())) return "failed";
+      const [a, b, c, d] = options as string[];
+      await connection.query(
+        `INSERT INTO question_translations
+           (question_id, question_uid, language, question_text, option_a, option_b, option_c, option_d, explanation, translation_status, translated_at)
+         VALUES (?, ?, 'en', ?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)
+         ON DUPLICATE KEY UPDATE question_uid = VALUES(question_uid), question_text = VALUES(question_text),
+           option_a = VALUES(option_a), option_b = VALUES(option_b), option_c = VALUES(option_c),
+           option_d = VALUES(option_d), explanation = VALUES(explanation),
+           translation_status = 'completed', translated_at = CURRENT_TIMESTAMP`,
+        [row.id, row.question_uid ?? null, autoTranslateBnToEn(row.question),
+          autoTranslateBnToEn(a), autoTranslateBnToEn(b), autoTranslateBnToEn(c), autoTranslateBnToEn(d),
+          row.explanation ? autoTranslateBnToEn(row.explanation) : null],
+      );
+      return "completed";
+    });
   } catch {
+    // Preserve cached wording and manual status when the transaction rolls back.
     try {
       await exec(
-        `INSERT INTO question_translations
-           (question_id, question_uid, language, question_text, option_a, option_b, option_c, option_d, explanation, translation_status)
-         VALUES (?, ?, 'en', ?, ?, ?, ?, ?, ?, 'failed')
-         ON DUPLICATE KEY UPDATE translation_status = 'failed'`,
-        [row.id, row.question_uid ?? null, row.question, a, b, c, d, row.explanation ?? null],
+        `UPDATE question_translations SET translation_status = 'failed'
+          WHERE question_id = ? AND language = 'en' AND translation_status != 'manually_edited'`,
+        [questionId],
       );
     } catch {}
     return "failed";
@@ -307,8 +307,13 @@ export async function validateSet(examId: string, set: SyncSet): Promise<SetVali
     const tr = translations.get(Number(m.id));
     // English translation is a pure projection: same ID, same order, same
     // correct_index (the identifier). Structural mismatch blocks publishing.
-    if (tr && (tr.translation_status === "completed" || tr.translation_status === "manually_edited")) covered += 1;
-    if (m.correct_index === null || m.correct_index === undefined) answersMatch = false;
+    if (tr && (tr.translation_status === "completed" || tr.translation_status === "manually_edited")
+      && [tr.question_text, tr.option_a, tr.option_b, tr.option_c, tr.option_d]
+        .every((value) => typeof value === "string" && value.trim())) covered += 1;
+    const options = parseJsonColumn<unknown[]>(m.options);
+    if (correctIndexToLetter(m.correct_index) === null || !m.question.trim()
+      || !Array.isArray(options) || options.length !== 4
+      || options.some((o) => typeof o !== "string" || !o.trim())) answersMatch = false;
   }
   const countsOk = masters.length === SET_REQUIRED_COUNT;
   if (!countsOk) blockers.push(`Question count ${masters.length}/${SET_REQUIRED_COUNT}.`);
@@ -337,13 +342,7 @@ export async function validateSet(examId: string, set: SyncSet): Promise<SetVali
 /** Set A ∩ Set B must be empty — question_uids are globally unique per exam. */
 export async function checkSetDisjoint(examId: string): Promise<{ disjoint: boolean; duplicates: string[] }> {
   await ensureAutoSyncTables();
-  const rows = await query<{ question_uid: string | null; set_label: string | null; n: number }[]>(
-    `SELECT question_uid, set_label, COUNT(*) AS n FROM exam_questions
-      WHERE exam_id = ? AND is_active = 1 AND question_uid IS NOT NULL
-      GROUP BY question_uid HAVING COUNT(*) > 1`,
-    [examId],
-  );
-  void rows;
+
   // Stronger check: same master row must not be assigned to both sets (a row
   // has exactly one set_label, so any shared question_uid across rows is a dup).
   const dupRows = await query<{ question_uid: string }[]>(

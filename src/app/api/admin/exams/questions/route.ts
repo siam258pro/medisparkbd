@@ -24,10 +24,17 @@ export async function GET(request: NextRequest) {
   const { normalizeSet, normalizeVersion } = await import("@/lib/exam-variants");
   const version = normalizeVersion(params.get("version"));
   const set = normalizeSet(params.get("set"));
-  const questions = await fetchQuestions({
-    examId: params.get("examId") ?? undefined,
-    subject: params.get("subject") ?? undefined,
-  });
+  let questions: Awaited<ReturnType<typeof fetchQuestions>>;
+  try {
+    // A failed read must surface as an error, not an empty "successful" editor.
+    questions = await fetchQuestions({
+      examId: params.get("examId") ?? undefined,
+      subject: params.get("subject") ?? undefined,
+    }, { throwOnError: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to load questions.";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
   // Version/Set view: overlay the authored variant content on the permanent
   // slots so each language/set is managed separately (same IDs, same order).
   if (version && set && (params.get("examId") ?? "") !== "bank") {
@@ -133,12 +140,68 @@ export async function POST(request: NextRequest) {
         return Number(retry[0]?.id ?? 0);
       };
       // Bulk variant save: { examId, version, set, questions: [...] }
+      // All-or-nothing: the whole batch is validated before any write, and
+      // slot creation plus every variant cell commit (or roll back) together.
       if (Array.isArray((body as Record<string, unknown>).questions)) {
         const examId = String((body as Record<string, unknown>).examId ?? "").trim();
         const items = (body as Record<string, unknown>).questions as Record<string, unknown>[];
         if (!examId) return NextResponse.json({ error: "Missing exam id." }, { status: 400 });
         if (items.length === 0) return NextResponse.json({ error: "No questions to save." }, { status: 400 });
         if (items.length > 200) return NextResponse.json({ error: "Too many questions in one batch (max 200)." }, { status: 400 });
+        type Prepared = {
+          idx: number; explicitId: number; order: number; text: string; options: string[];
+          correctIndex: number; explanation: string | null; marks: number; questionImage: string | null;
+        };
+        const errors: { index: number; error: string }[] = [];
+        const prepared: Prepared[] = [];
+        const seenIds = new Set<number>();
+        const seenOrders = new Set<number>();
+        for (let idx = 0; idx < items.length; idx += 1) {
+          const item = items[idx] as Record<string, unknown>;
+          const explicitId = num(item?.id, 0);
+          const hasExplicitId = Number.isInteger(explicitId) && explicitId > 0;
+          const order = num(item?.order, idx + 1);
+          if (hasExplicitId) {
+            if (seenIds.has(explicitId)) {
+              errors.push({ index: idx, error: "Duplicate question id in this batch." });
+              continue;
+            }
+            seenIds.add(explicitId);
+          } else {
+            if (!Number.isInteger(order) || order <= 0) {
+              errors.push({ index: idx, error: "Missing question slot." });
+              continue;
+            }
+            if (seenOrders.has(order)) {
+              errors.push({ index: idx, error: "Duplicate slot order in this batch." });
+              continue;
+            }
+            seenOrders.add(order);
+          }
+          const qImage = str(item?.questionImage) || str(item?.question_image) || null;
+          const text = str(item?.question);
+          if (text.trim().length < 3 && !qImage) {
+            errors.push({ index: idx, error: "Question text too short." });
+            continue;
+          }
+          const options = Array.isArray(item?.options) ? (item.options as unknown[]).map((o) => String(o)) : [];
+          if (options.length < 2 || options.some((o) => o.length === 0)) {
+            errors.push({ index: idx, error: "At least 2 non-empty options required." });
+            continue;
+          }
+          const correctIndex = num(item?.correctIndex, -1);
+          if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= options.length) {
+            errors.push({ index: idx, error: "Invalid correctIndex." });
+            continue;
+          }
+          prepared.push({
+            idx, explicitId: hasExplicitId ? explicitId : 0, order, text, options, correctIndex,
+            explanation: str(item?.explanation) || null, marks: num(item?.marks, 1) || 1, questionImage: qImage,
+          });
+        }
+        if (errors.length > 0) {
+          return NextResponse.json({ error: "Some questions are invalid. Nothing was saved.", errors }, { status: 400 });
+        }
         // Snapshot the answer key BEFORE writing — a changed key triggers
         // automatic result recalculation after the save (single source of truth).
         let keyBefore: import("@/lib/exam-recalculation").AnswerKeySnapshot | null = null;
@@ -146,69 +209,88 @@ export async function POST(request: NextRequest) {
           const { snapshotAnswerKey } = await import("@/lib/exam-recalculation");
           keyBefore = await snapshotAnswerKey(examId);
         } catch {}
-        const slotRows = await query<{ id: number; sort_order: number }[]>(
-          `SELECT id, sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC, id ASC`,
-          [examId],
-        );
-        const byOrder = new Map(slotRows.map((r) => [Number(r.sort_order), Number(r.id)]));
-        const examSlotIds = new Set(slotRows.map((r) => Number(r.id)));
-        let saved = 0;
-        const errors: { index: number; error: string }[] = [];
-        for (let idx = 0; idx < items.length; idx += 1) {
-          const item = items[idx] as Record<string, unknown>;
-          const explicitId = num(item.id, 0);
-          const hasExplicitId = Number.isInteger(explicitId) && explicitId > 0;
-          if (hasExplicitId && !examSlotIds.has(explicitId)) {
-            errors.push({ index: idx, error: "Question does not belong to this exam." });
-            continue;
+        const { withTransaction } = await import("@/lib/mysql");
+        const { saveVariantInTransaction, ensureVariantTables } = await import("@/lib/exam-variants");
+        class BatchRejected extends Error {
+          details: { index: number; error: string }[];
+          constructor(message: string, details: { index: number; error: string }[]) {
+            super(message);
+            this.details = details;
           }
-          const order = num(item.order, idx + 1);
-          let questionId = Number.isInteger(explicitId) && explicitId > 0
-            ? explicitId
-            : (byOrder.get(order) ?? 0);
-          if (!questionId && Number.isInteger(order) && order > 0) {
-             
-            questionId = await resolveOrCreateSlot(examId, order);
-          }
-          if (!questionId) {
-            errors.push({ index: idx, error: "Missing question slot." });
-            continue;
-          }
-          const qImage = str(item.questionImage) || str(item.question_image) || null;
-          const text = str(item.question);
-          if (text.trim().length < 3 && !qImage) {
-            errors.push({ index: idx, error: "Question text too short." });
-            continue;
-          }
-          const options = Array.isArray(item.options) ? item.options.map((o) => String(o)) : [];
-          if (options.length < 2 || options.some((o) => o.length === 0)) {
-            errors.push({ index: idx, error: "At least 2 non-empty options required." });
-            continue;
-          }
-          const correctIndex = num(item.correctIndex, -1);
-          if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex >= options.length) {
-            errors.push({ index: idx, error: "Invalid correctIndex." });
-            continue;
-          }
-           
-          await saveVariant({
-            questionId,
-            version: bodyVersion,
-            set: bodySet,
-            question: text,
-            options,
-            correctIndex,
-            explanation: str(item.explanation) || null,
-            marks: num(item.marks, 1) || 1,
-            questionImage: qImage,
+        }
+        let savedIds: number[] = [];
+        try {
+          await ensureVariantTables();
+          savedIds = await withTransaction(async (connection) => {
+            const run = async <T,>(sql: string, params: unknown[] = []): Promise<T> => {
+              const [rows] = await connection.query(sql, params);
+              return rows as T;
+            };
+            // The exam row lock serializes concurrent uploads, so a missing
+            // slot is created exactly once without relying on a unique key.
+            const examRows = await run<{ id: string; marks_per_question: string | number | null }[]>(
+              `SELECT id, marks_per_question FROM exams WHERE id = ? FOR UPDATE`, [examId],
+            );
+            if (!examRows[0]) throw new BatchRejected("Exam not found.", []);
+            const rawMarks = Number(examRows[0].marks_per_question ?? 1);
+            const marksPerSlot = Number.isFinite(rawMarks) && rawMarks > 0 ? rawMarks : 1;
+            const slotRows = await run<{ id: number; sort_order: number }[]>(
+              `SELECT id, sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC, id ASC FOR UPDATE`, [examId],
+            );
+            const byOrder = new Map(slotRows.map((r) => [Number(r.sort_order), Number(r.id)]));
+            const examSlotIds = new Set(slotRows.map((r) => Number(r.id)));
+            const slotErrors: { index: number; error: string }[] = [];
+            const resolved = new Set<number>();
+            const targets: { entry: Prepared; questionId: number }[] = [];
+            for (const entry of prepared) {
+              let questionId = entry.explicitId;
+              if (questionId && !examSlotIds.has(questionId)) {
+                slotErrors.push({ index: entry.idx, error: "Question does not belong to this exam." });
+                continue;
+              }
+              if (!questionId) questionId = byOrder.get(entry.order) ?? 0;
+              if (questionId && resolved.has(questionId)) {
+                slotErrors.push({ index: entry.idx, error: "Two questions resolve to the same slot." });
+                continue;
+              }
+              if (questionId) resolved.add(questionId);
+              targets.push({ entry, questionId });
+            }
+            if (slotErrors.length > 0) throw new BatchRejected("Some questions are invalid. Nothing was saved.", slotErrors);
+            for (const target of targets) {
+              if (target.questionId) continue;
+              const [inserted] = await connection.query(
+                `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [examId, "", "", null, JSON.stringify(["", "", "", ""]), null, null, marksPerSlot, target.entry.order, 1],
+              );
+              const insertId = Number((inserted as unknown as { insertId?: number })?.insertId);
+              if (!Number.isSafeInteger(insertId) || insertId <= 0) throw new Error("Database did not return the new question slot id.");
+              target.questionId = insertId;
+            }
+            for (const { entry, questionId } of targets) {
+              await saveVariantInTransaction(connection, {
+                questionId,
+                version: bodyVersion,
+                set: bodySet,
+                question: entry.text,
+                options: entry.options,
+                correctIndex: entry.correctIndex,
+                explanation: entry.explanation,
+                marks: entry.marks,
+                questionImage: entry.questionImage,
+              });
+            }
+            return targets.map((target) => target.questionId);
           });
-          saved += 1;
-          examSlotIds.add(questionId);
-          byOrder.set(order, questionId);
+        } catch (error) {
+          if (error instanceof BatchRejected) {
+            return NextResponse.json({ error: error.message, ...(error.details.length > 0 ? { errors: error.details } : {}) }, { status: 400 });
+          }
+          const message = error instanceof Error ? error.message : "Failed to save questions.";
+          return NextResponse.json({ error: message }, { status: 400 });
         }
-        if (saved === 0) {
-          return NextResponse.json({ error: "No valid questions to save.", errors }, { status: 400 });
-        }
+        const saved = savedIds.length;
         await logAdminAction(admin, "question.variant_bulk_save", `exam=${examId} ${bodyVersion}/${bodySet} count=${saved}`, request);
         // Answer-key correction → recalculate affected results from answers + latest key.
         let recalculated = 0;
@@ -220,7 +302,7 @@ export async function POST(request: NextRequest) {
             await logAdminAction(admin, "question.recalculate", `exam=${examId} results=${recalculated}`, request);
           }
         } catch {}
-        return NextResponse.json({ ok: true, saved, ...(recalculated > 0 ? { recalculated } : {}), ...(errors.length > 0 ? { errors } : {}) });
+        return NextResponse.json({ ok: true, saved, savedIds, ...(recalculated > 0 ? { recalculated } : {}) });
       }
       // Single variant save.
       const examId = asString((body as Record<string, unknown>).examId).trim();
@@ -401,8 +483,10 @@ export async function PUT(request: NextRequest) {
   if (!Array.isArray(body?.order)) {
     return NextResponse.json({ error: "Invalid order payload." }, { status: 400 });
   }
-  const ids = (body.order as unknown[]).map(Number).filter((n) => Number.isInteger(n) && n > 0);
-  if (ids.length === 0) return NextResponse.json({ error: "No valid ids." }, { status: 400 });
+  const ids = (body.order as unknown[]).map(Number);
+  if (ids.length === 0 || ids.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(ids).size !== ids.length) {
+    return NextResponse.json({ error: "Invalid or duplicate question ids." }, { status: 400 });
+  }
   try {
     const questions = await reorderQuestions(examId, ids);
     await logAdminAction(admin, "question.reorder", `exam=${examId ?? "bank"} count=${ids.length}`, request);
@@ -422,7 +506,7 @@ export async function PATCH(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as { id?: unknown; examId?: unknown } | null;
   const id = Number(body?.id);
   const examId = typeof body?.examId === "string" ? body.examId : "";
-  if (!Number.isInteger(id) || !examId) {
+  if (!Number.isSafeInteger(id) || id <= 0 || !examId) {
     return NextResponse.json({ error: "Missing question id or exam id." }, { status: 400 });
   }
   try {
@@ -441,11 +525,60 @@ export async function DELETE(request: NextRequest) {
   if (!admin) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
-  const body = (await request.json().catch(() => null)) as { id?: unknown } | null;
+  const body = (await request.json().catch(() => null)) as {
+    id?: unknown;
+    examId?: unknown;
+    version?: unknown;
+    set?: unknown;
+    clearAll?: unknown;
+  } | null;
+  const { normalizeSet, normalizeVersion } = await import("@/lib/exam-variants");
+  const version = normalizeVersion(body?.version);
+  const set = normalizeSet(body?.set);
+  // Bulk clear: delete every variant cell for (examId, version, set). Base slots stay.
+  if (body?.clearAll === true) {
+    const examId = typeof body?.examId === "string" ? body.examId.trim() : "";
+    if (!examId || !version || !set) {
+      return NextResponse.json({ error: "Missing exam id, version or set." }, { status: 400 });
+    }
+    try {
+      const { clearVariantsForExam } = await import("@/lib/exam-variants");
+      const cleared = await clearVariantsForExam(examId, version, set);
+      await logAdminAction(admin, "question.variant_clear", `exam=${examId} ${version}/${set} cleared=${cleared}`, request);
+      try {
+        const { snapshotAnswerKey } = await import("@/lib/exam-recalculation");
+        const before = await snapshotAnswerKey(examId);
+        const { recalculateIfAnswerKeyChanged } = await import("@/lib/exam-recalculation");
+        await recalculateIfAnswerKeyChanged(examId, before);
+      } catch {}
+      return NextResponse.json({ ok: true, cleared });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to clear questions.";
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
+  }
   const id = Number(body?.id);
-  if (!Number.isInteger(id)) {
+  if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json({ error: "Missing question id." }, { status: 400 });
   }
-  await deleteQuestion(id);
-  return NextResponse.json({ ok: true });
+  // Single variant-cell delete: { id, version, set } clears only that workspace cell.
+  if (version && set) {
+    try {
+      const { deleteVariant } = await import("@/lib/exam-variants");
+      await deleteVariant(id, version, set);
+      await logAdminAction(admin, "question.variant_delete", `id=${id} ${version}/${set}`, request);
+      return NextResponse.json({ ok: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to delete the question.";
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
+  }
+  try {
+    await deleteQuestion(id);
+    await logAdminAction(admin, "question.delete", `id=${id}`, request);
+    return NextResponse.json({ ok: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to delete the question.";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
 }

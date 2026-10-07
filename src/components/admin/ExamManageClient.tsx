@@ -96,7 +96,7 @@ function InfoTab({
     categoryId: exam.categoryId ?? "",
     bannerUrl: exam.bannerUrl ?? "",
     durationMinutes: String(exam.durationMinutes),
-    questionCount: String(exam.questionCount || 30),
+    questionCount: String(exam.questionCount),
     marksPerQuestion: String(exam.marksPerQuestion ?? 1),
     subject: exam.subject ?? "",
     courseType: exam.courseType ?? "Academic",
@@ -115,7 +115,7 @@ function InfoTab({
       categoryId: exam.categoryId ?? "",
       bannerUrl: exam.bannerUrl ?? "",
       durationMinutes: String(exam.durationMinutes),
-      questionCount: String(exam.questionCount || 30),
+      questionCount: String(exam.questionCount),
       marksPerQuestion: String(exam.marksPerQuestion ?? 1),
       subject: exam.subject ?? "",
       courseType: exam.courseType ?? "Academic",
@@ -158,6 +158,12 @@ function InfoTab({
       setNotice({ kind: "error", text: "Select a category for this public exam." });
       return;
     }
+    const count = Number(form.questionCount);
+    const marks = Number(form.marksPerQuestion);
+    if (!Number.isInteger(count) || count < 0 || count > 500 || !Number.isFinite(marks) || marks < 0.5 || marks > 100) {
+      setNotice({ kind: "error", text: "Use 0–500 whole questions and 0.5–100 marks per question." });
+      return;
+    }
     setBusy(true);
     setNotice(null);
     try {
@@ -173,8 +179,8 @@ function InfoTab({
           subject: form.subject,
           courseType: form.courseType,
           durationMinutes: Number(form.durationMinutes) || 30,
-          questionCount: Number(form.questionCount) || 30,
-          marksPerQuestion: Number(form.marksPerQuestion) || 1,
+          questionCount: count,
+          marksPerQuestion: marks,
           totalMarks,
           bannerUrl: form.bannerUrl || null,
           status: form.status,

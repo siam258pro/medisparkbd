@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   buttonPrimaryClass,
   buttonSecondaryClass,
@@ -132,12 +132,15 @@ export default function ExamPaperEditor({
   const [questions, setQuestions] = useState<ExamQuestion[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [detectBusy, setDetectBusy] = useState(false);
+  const [saveAllBusy, setSaveAllBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [drafts, setDrafts] = useState<Record<number, SlotDraft>>({});
   // Language Version (Bangla / English) × Set (A / B): four separate
   // workspaces sharing the same permanent Question IDs and slot order.
   // Each workspace has its own paste area — no auto-translation between them.
   const [langVersion, setLangVersion] = useState<LangVersion>("bangla");
   const [setLabel, setSetLabel] = useState<SetLabel>("A");
-  const activeTab = tabKey(langVersion, setLabel);
+  const activeTab = `${exam.id}:${tabKey(langVersion, setLabel)}`;
   const [bulkTexts, setBulkTexts] = useState<Record<string, string>>({});
   const bulkText = bulkTexts[activeTab] ?? "";
   const setBulkText = useCallback((value: string) => {
@@ -191,24 +194,33 @@ export default function ExamPaperEditor({
   // write results into a different workspace the admin switched to mid-save.
   // (No automatic refetch happens on save — the Refresh button is the only
   // manual refresh; saves merge into local state instead.)
-  const workspaceRef = useRef<{ v: LangVersion; s: SetLabel }>({ v: langVersion, s: setLabel });
-  workspaceRef.current = { v: langVersion, s: setLabel };
+  const workspace = useMemo(() => ({ examId: exam.id, v: langVersion, s: setLabel }), [exam.id, langVersion, setLabel]);
+  const workspaceRef = useRef(workspace);
+  useLayoutEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
+  const draftGenerationRef = useRef(0);
+  const saveOperationRef = useRef(0);
+  const imageOperationRef = useRef(0);
+  const ocrOperationRef = useRef(0);
 
   const load = useCallback(async (forVersion?: LangVersion, forSet?: SetLabel) => {
     const v = forVersion ?? langVersion;
     const s = forSet ?? setLabel;
     const version = ++loadVersionRef.current;
+    const workspace = workspaceRef.current;
     try {
       const res = await fetch(`/api/admin/exams/questions?examId=${encodeURIComponent(exam.id)}&version=${v}&set=${s}`, {
         cache: "no-store",
         headers: authHeaders,
       });
       const data = (await res.json()) as { questions?: ExamQuestion[] };
-      if (version === loadVersionRef.current) setQuestions(data.questions ?? []);
+      if (!res.ok || !Array.isArray(data.questions)) throw new Error("Failed to load questions.");
+      if (version === loadVersionRef.current && workspaceRef.current === workspace) setQuestions(data.questions);
     } catch {
       // Never blank the visible list on a failed fetch — keep showing the
       // current questions/counters and let an explicit refresh retry.
-      if (version === loadVersionRef.current) setQuestions((prev) => prev ?? []);
+      if (version === loadVersionRef.current && workspaceRef.current === workspace) setQuestions((prev) => prev ?? []);
     }
   }, [exam.id, authHeaders, langVersion, setLabel]);
 
@@ -220,7 +232,7 @@ export default function ExamPaperEditor({
       });
       if (res.ok) {
         const data = (await res.json()) as { totalSlots: number; coverage: Record<string, number>; hasAnyVariant: boolean };
-        setCoverage(data);
+        if (workspaceRef.current.examId === exam.id) setCoverage(data);
       }
     } catch {
       // Coverage badges are best-effort.
@@ -239,12 +251,17 @@ export default function ExamPaperEditor({
   // workspace never leaks into another. questions must be nulled so the UI
   // shows "Loading…" while the new workspace data is fetched.
   useEffect(() => {
+    draftGenerationRef.current += 1;
     setQuestions(null);
     setDrafts({});
     setDetectionCleared(false);
     setDetectWarnings({});
     setDetectExistingMap({});
     setSavingSlot(null);
+    setImageUploadingSlot(null);
+    setSaveAllBusy(false);
+    setAnswerKeyBusy(false);
+    setRefreshing(false);
     setError(null);
     setNotice(null);
     setAnswerKeyMsg(null);
@@ -253,7 +270,8 @@ export default function ExamPaperEditor({
     setAddKeyNum("");
     // NOTE: bulkTexts / answerKeyTexts / answerKeyMaps persist per workspace tab.
      
-  }, [activeTab]);
+  }, [activeTab, exam.id]);
+
 
   const totalSlots = useMemo(() => {
     const qCount = Number(exam.questionCount ?? exam.totalQuestions ?? 0);
@@ -269,8 +287,6 @@ export default function ExamPaperEditor({
 
   // Local drafts for inline editing — UNSAVED until "Save Questions" is clicked.
   // Typing, detecting, answering and image uploads only touch these drafts.
-  const [drafts, setDrafts] = useState<Record<number, SlotDraft>>({});
-
   // Effective total: never truncate pasted detection. If admin pastes 20/50/100,
   // preview shows all, even if exam was configured for 10. Extra slots are
   // kept as unsaved drafts and auto-created on Save via resolveOrCreateSlot.
@@ -294,7 +310,7 @@ export default function ExamPaperEditor({
       return questions.map((q, i) => ({ index: i, q }));
     }
     return list;
-  }, [questions, effectiveTotalSlots]);
+  }, [questions, effectiveTotalSlots, detectionCleared]);
 
   const progressText =
     effectiveTotalSlots > 0
@@ -319,7 +335,7 @@ export default function ExamPaperEditor({
       return merged;
     });
      
-  }, [questions, totalSlots]);
+  }, [questions, totalSlots, detectionCleared]);
 
   // Number of slots with unsaved changes (powers the Save button label).
   const dirtyCount = useMemo(() => {
@@ -404,6 +420,7 @@ export default function ExamPaperEditor({
           sourceNumber: questionNumberForIndex(p.originalNumber, i),
         };
       }
+      draftGenerationRef.current += 1;
       setDrafts(newDrafts);
 
       // No database writes here — the admin reviews and clicks Save Questions.
@@ -488,6 +505,9 @@ export default function ExamPaperEditor({
       setAnswerKeyError("Too many images (max 10 per batch).");
       return;
     }
+    const workspace = workspaceRef.current;
+    const generation = draftGenerationRef.current;
+    const operation = ++ocrOperationRef.current;
     setAnswerKeyBusy(true);
     const collected: string[] = [];
     try {
@@ -503,6 +523,7 @@ export default function ExamPaperEditor({
           body: fd,
         });
         const data = (await res.json().catch(() => null)) as { texts?: string[]; error?: string } | null;
+        if (workspaceRef.current !== workspace || draftGenerationRef.current !== generation || ocrOperationRef.current !== operation) return;
         if (!res.ok) throw new Error(data?.error ?? "OCR failed.");
         const pageText = (data?.texts ?? []).join("\n").trim();
         if (pageText) collected.push(pageText);
@@ -516,11 +537,15 @@ export default function ExamPaperEditor({
       setAnswerKeyText(combined);
       handleDetectAnswerKey(combined);
     } catch (e) {
-      setAnswerKeyError(e instanceof Error ? e.message : "Answer-key OCR failed.");
+      if (workspaceRef.current === workspace && draftGenerationRef.current === generation && ocrOperationRef.current === operation) {
+        setAnswerKeyError(e instanceof Error ? e.message : "Answer-key OCR failed.");
+      }
     } finally {
-      setAnswerKeyBusy(false);
-      setAnswerKeyOcrBusy(null);
-      if (answerKeyFileRef.current) answerKeyFileRef.current.value = "";
+      if (ocrOperationRef.current === operation) {
+        setAnswerKeyBusy(false);
+        setAnswerKeyOcrBusy(null);
+        if (answerKeyFileRef.current) answerKeyFileRef.current.value = "";
+      }
     }
   }
 
@@ -679,13 +704,14 @@ export default function ExamPaperEditor({
    * reported, never written. Local state is merged (no refetch) so the page
    * never reloads on save.
    */
-  const [saveAllBusy, setSaveAllBusy] = useState(false);
-
   async function handleSaveAll() {
     setError(null);
     setNotice(null);
     const saveVersion = langVersion;
     const saveSet = setLabel;
+    const workspace = workspaceRef.current;
+    const generation = draftGenerationRef.current;
+    const operation = ++saveOperationRef.current;
     const marksPerQ = Number(exam.marksPerQuestion ?? 1) || 1;
     const indices = Object.keys(drafts).map(Number).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
     if (indices.length === 0) {
@@ -734,7 +760,7 @@ export default function ExamPaperEditor({
         correctIndex: remapped,
         explanation: d.explanation.trim() ? d.explanation : null,
         marks: existing?.marks ?? marksPerQ,
-        questionImage: d.questionImage ?? existing?.questionImage ?? null,
+        questionImage: d.questionImage,
       });
     }
     if (items.length === 0) {
@@ -745,6 +771,8 @@ export default function ExamPaperEditor({
       );
       return;
     }
+    const confirmedItems: BulkItem[] = [];
+    const rejectedNotes: string[] = [];
     setSaveAllBusy(true);
     try {
       // One bulk request per 200 items (server batch cap) to existing storage.
@@ -762,18 +790,49 @@ export default function ExamPaperEditor({
             questions: chunk.map(({ slotIndex: _slot, ...rest }) => rest),
           }),
         });
-        const data = (await res.json().catch(() => null)) as { error?: string; saved?: number } | null;
+        const data = (await res.json().catch(() => null)) as { error?: string; saved?: number; savedIds?: number[]; errors?: { index: number; error: string }[] } | null;
         if (!res.ok) throw new Error(data?.error ?? "Failed to save questions.");
-        saved += typeof data?.saved === "number" ? data.saved : chunk.length;
-        // Stop touching another workspace if the admin switched tabs mid-save.
-        if (workspaceRef.current.v !== saveVersion || workspaceRef.current.s !== saveSet) break;
+        const rejected = new Set((data?.errors ?? []).map((failure) => failure.index));
+        if ([...rejected].some((index) => !Number.isInteger(index) || index < 0 || index >= chunk.length)) throw new Error("Unexpected save response — Refresh to verify saved questions.");
+        // Keep the permanent slot IDs the server acknowledged (aligned to the chunk order).
+        const ackIds = Array.isArray(data?.savedIds) ? data.savedIds : [];
+        const confirmed = chunk.flatMap((item, index) => {
+          if (rejected.has(index)) return [];
+          const ackId = Number(ackIds[index]);
+          return [Number.isSafeInteger(ackId) && ackId > 0 ? { ...item, id: ackId } : item];
+        });
+        if (typeof data?.saved !== "number" || data.saved !== confirmed.length) throw new Error("Unexpected saved count — Refresh to verify saved questions.");
+        confirmedItems.push(...confirmed);
+        saved += data.saved;
+        for (const failure of data.errors ?? []) {
+          const note = `Q${pad(chunk[failure.index].slotIndex + 1)} (${failure.error})`;
+          skipped.push(note);
+          rejectedNotes.push(note);
+        }
+        // Object identity also catches switching away and back to the same tab.
+        if (workspaceRef.current !== workspace || draftGenerationRef.current !== generation) return;
       }
-      // Merge saved content into local state only — no refetch, no reload,
-      // so typing, scroll position and drafts are never lost on save.
-      if (workspaceRef.current.v === saveVersion && workspaceRef.current.s === saveSet) {
+      void loadCoverage();
+      onChanged?.();
+      let msg = `Saved ${saved} question${saved === 1 ? "" : "s"} to ${saveVersion} Set ${saveSet}.`;
+      if (skipped.length > 0) msg += ` Skipped (need review): ${skipped.join(", ")}.`;
+      setNotice(msg);
+      // A partially accepted batch must not read as a clean success.
+      if (rejectedNotes.length > 0) setError(`Not saved — rejected by the server: ${rejectedNotes.join(", ")}.`);
+      setTimeout(() => setNotice(null), 8000);
+      scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (e) {
+      if (workspaceRef.current === workspace && draftGenerationRef.current === generation) {
+        const partial = confirmedItems.length > 0 ? `${confirmedItems.length} questions saved before the failure. ` : "";
+        setError(partial + (e instanceof Error ? e.message : "Save failed."));
+      }
+    } finally {
+      // Only server-confirmed items become the saved baseline, even when a
+      // later batch fails. Preserve any edits made during the request.
+      if (confirmedItems.length > 0 && workspaceRef.current === workspace && draftGenerationRef.current === generation) {
         setQuestions((prev) => {
           const next = [...(prev ?? [])];
-          for (const item of items) {
+          for (const item of confirmedItems) {
             while (next.length <= item.slotIndex) next.push(null as unknown as ExamQuestion);
             const existing = next[item.slotIndex];
             next[item.slotIndex] = {
@@ -792,33 +851,40 @@ export default function ExamPaperEditor({
           }
           return next;
         });
+        setDrafts((prev) => {
+          const next = { ...prev };
+          for (const item of confirmedItems) {
+            if (prev[item.slotIndex] !== drafts[item.slotIndex]) continue;
+            next[item.slotIndex] = {
+              ...prev[item.slotIndex],
+              question: item.question,
+              options: [...item.options, ...EMPTY_OPTIONS].slice(0, 4),
+              correctIndex: item.correctIndex,
+              explanation: item.explanation ?? "",
+              questionImage: item.questionImage,
+            };
+          }
+          return next;
+        });
       }
-      void loadCoverage();
-      onChanged?.();
-      let msg = `Saved ${saved} question${saved === 1 ? "" : "s"} to ${saveVersion} Set ${saveSet}.`;
-      if (skipped.length > 0) msg += ` Skipped (need review): ${skipped.join(", ")}.`;
-      setNotice(msg);
-      setTimeout(() => setNotice(null), 8000);
-      scrollContainerRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Save failed.");
-    } finally {
-      setSavingSlot(null);
-      setSaveAllBusy(false);
+      if (saveOperationRef.current === operation) {
+        setSavingSlot(null);
+        setSaveAllBusy(false);
+      }
     }
   }
 
   /**
-   * "Remove All" — immediately clears the current detection state only
-   * (displayed slots, drafts, warnings, paste area, unsaved images) and
-   * returns the page to an empty detection state. Never touches the
-   * database; previously saved questions stay saved and come back on
-   * Refresh. Removed drafts are never recreated.
+   * "Remove All" — clears the current workspace view (displayed slots,
+   * drafts, warnings, paste area) AND deletes the saved variant cells for
+   * this version/set from the database, so Refresh no longer brings them
+   * back. Base slots stay; other versions/sets are untouched.
    */
-  function handleRemoveAll() {
-    if (!window.confirm("Remove all detected questions?")) return;
+  async function handleRemoveAll() {
+    if (!window.confirm("Remove all questions for this Version/Set (including saved)?")) return;
     // Invalidate any in-flight load()/refresh so saved rows can't repopulate the cleared view.
     loadVersionRef.current += 1;
+    draftGenerationRef.current += 1;
     setError(null);
     setDetectionCleared(true);
     setDetectWarnings({});
@@ -831,26 +897,95 @@ export default function ExamPaperEditor({
     setAnswerKeyMsg(null);
     setAnswerKeyError(null);
     // Empty detection state: clear displayed slots + question count (0).
-    // Saved rows in the database are untouched — top Refresh reloads them.
     setQuestions([]);
     setSavingSlot(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
-    setNotice("Detection cleared — paste a new question set, then Detect.");
+    try {
+      const res = await fetch("/api/admin/exams/questions", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({ examId: exam.id, version: langVersion, set: setLabel, clearAll: true }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(data?.error ?? "Failed to clear saved questions.");
+      }
+      void loadCoverage();
+      onChanged?.();
+      setNotice("All questions for this Version/Set removed (drafts + saved).");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Remove failed.");
+      setNotice("Detection cleared locally — saved questions may still return on Refresh.");
+    }
     setTimeout(() => setNotice(null), 5000);
+  }
+
+  /** Remove one slot: clears its draft and deletes its saved variant cell
+   *  for this version/set (when present). Unsaved-only slots just clear. */
+  async function handleRemoveSlot(slotIndex: number) {
+    const slot = slotIndex < displaySlots.length ? displaySlots[slotIndex] : null;
+    const q = slot?.q ?? null;
+    const savedId = q?.id;
+    const hasSavedVariant = q?.hasVariant === true || ((q?.question?.trim().length ?? 0) >= 3 && savedId !== null && savedId !== undefined);
+    if (hasSavedVariant && savedId !== null && savedId !== undefined) {
+      if (!window.confirm(`Remove Q${pad(slotIndex + 1)} (including saved)?`)) return;
+    }
+    setDetectWarnings((prev) => {
+      if (!(slotIndex in prev)) return prev;
+      const next = { ...prev };
+      delete next[slotIndex];
+      return next;
+    });
+    setDetectExistingMap((prev) => {
+      if (!(slotIndex in prev)) return prev;
+      const next = { ...prev };
+      delete next[slotIndex];
+      return next;
+    });
+    if (hasSavedVariant && savedId !== null && savedId !== undefined) {
+      try {
+        const res = await fetch("/api/admin/exams/questions", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({ id: savedId, version: langVersion, set: setLabel }),
+        });
+        if (!res.ok) {
+          const data = (await res.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(data?.error ?? "Failed to delete saved question.");
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Remove failed.");
+        return;
+      }
+      setQuestions((prev) => {
+        if (!prev) return prev;
+        const next = [...prev];
+        if (slotIndex < next.length && next[slotIndex]) {
+          next[slotIndex] = { ...next[slotIndex], question: "", options: [], correctIndex: null, explanation: null, questionImage: null, hasVariant: false };
+        }
+        return next;
+      });
+      void loadCoverage();
+      onChanged?.();
+    }
+    setDrafts((prev) => {
+      const next = { ...prev };
+      next[slotIndex] = emptyDraft();
+      return next;
+    });
   }
 
   /** Global Refresh (top button — the only refresh control on this page).
    * Fetches the latest saved data, then displays it. Never clears anything
    * beforehand: the current list and counters stay visible during the fetch,
    * drafts are replaced only after fresh data arrives, and a failed fetch
-   * keeps everything as it was. Completely separate from Remove All (which
-   * never touches the database). */
-  const [refreshing, setRefreshing] = useState(false);
-
+   * keeps everything as it was. */
   async function handleRefresh() {
     const v = langVersion;
     const s = setLabel;
     const token = ++loadVersionRef.current;
+    const workspace = workspaceRef.current;
+    const generation = draftGenerationRef.current;
     const url = `/api/admin/exams/questions?examId=${encodeURIComponent(exam.id)}&version=${v}&set=${s}`;
     setRefreshing(true);
     setError(null);
@@ -888,13 +1023,14 @@ export default function ExamPaperEditor({
         throw new Error("BAD_RESPONSE");
       }
       if (token !== loadVersionRef.current) return;
-      if (workspaceRef.current.v !== v || workspaceRef.current.s !== s) return;
+      if (workspaceRef.current !== workspace || draftGenerationRef.current !== generation) return;
+      draftGenerationRef.current += 1;
       const fresh = data.questions as ExamQuestion[];
       setQuestions(fresh);
       setDetectionCleared(false);
       const next: Record<number, SlotDraft> = {};
-      for (let i = 0; i < totalSlots; i++) {
-        next[i] = draftFromQuestion(i < fresh.length ? fresh[i] : null);
+      for (let i = 0; i < Math.max(totalSlots, fresh.length); i++) {
+        next[i] = { ...draftFromQuestion(i < fresh.length ? fresh[i] : null), sourceNumber: i + 1 };
       }
       setDrafts(next);
       setDetectWarnings({});
@@ -902,6 +1038,7 @@ export default function ExamPaperEditor({
       setNotice(null);
       void loadCoverage();
     } catch (e) {
+      if (token !== loadVersionRef.current || workspaceRef.current !== workspace || draftGenerationRef.current !== generation) return;
       // Keep everything visible — report what actually happened.
        
       console.error("[ExamPaperEditor] refresh failed:", e);
@@ -937,6 +1074,9 @@ export default function ExamPaperEditor({
       setError("Not authorized — sign in as admin.");
       return;
     }
+    const workspace = workspaceRef.current;
+    const generation = draftGenerationRef.current;
+    const operation = ++imageOperationRef.current;
     setImageUploadingSlot(slotIndex);
     setError(null);
     try {
@@ -950,6 +1090,7 @@ export default function ExamPaperEditor({
         body: file,
       });
       const data = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (workspaceRef.current !== workspace || draftGenerationRef.current !== generation || imageOperationRef.current !== operation) return;
       if (!res.ok || !data.url) throw new Error(data.error || "Upload failed.");
       const url = data.url;
       setDrafts((prev) => {
@@ -959,10 +1100,14 @@ export default function ExamPaperEditor({
       setNotice("Image attached (unsaved — click Save Questions to keep it).");
       setTimeout(() => setNotice(null), 4000);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Image upload failed.");
+      if (workspaceRef.current === workspace && draftGenerationRef.current === generation && imageOperationRef.current === operation) {
+        setError(e instanceof Error ? e.message : "Image upload failed.");
+      }
     } finally {
-      setImageUploadingSlot(null);
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      if (imageOperationRef.current === operation) {
+        setImageUploadingSlot(null);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+      }
     }
   }
 
@@ -1067,9 +1212,9 @@ export default function ExamPaperEditor({
             <button
               type="button"
               disabled={detectBusy || busy || saveAllBusy}
-              onClick={handleRemoveAll}
+              onClick={() => void handleRemoveAll()}
               className="w-full rounded-xl border border-red-200 bg-white px-5 py-2.5 text-sm font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 sm:w-auto admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300 admin-dark:hover:bg-red-500/10"
-              title="Clear detected questions from this page only (saved questions are not deleted)"
+              title="Remove all questions for this Version/Set (drafts + saved)"
             >
               Remove All
             </button>
@@ -1271,7 +1416,7 @@ export default function ExamPaperEditor({
         ) : detectionCleared ? (
           <div className={`${cardClass} p-6 text-center`}>
             <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">Detection cleared.</p>
-            <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect. Saved questions are untouched — Refresh reloads them.</p>
+            <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect.</p>
           </div>
         ) : totalSlots === 0 ? (
           <div className={`${cardClass} p-6 text-center`}>
@@ -1308,6 +1453,14 @@ export default function ExamPaperEditor({
                       {warnings && warnings.length > 0 && (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold text-amber-700 admin-dark:bg-amber-900/30 admin-dark:text-amber-300">Needs review</span>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => void handleRemoveSlot(index)}
+                        className="rounded-lg border border-red-200 bg-white px-2 py-0.5 text-[10px] font-bold text-red-600 hover:bg-red-50 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
+                        title={`Remove Q${pad(slotNumber)} from this Version/Set`}
+                      >
+                        Remove
+                      </button>
                     </div>
                   </div>
 
@@ -1477,7 +1630,7 @@ export default function ExamPaperEditor({
           ) : detectionCleared ? (
             <div className={`${cardClass} p-6 text-center`}>
               <p className="text-sm font-bold text-[#0b1e3a] admin-dark:text-zinc-100">Detection cleared.</p>
-              <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect. Saved questions are untouched — Refresh reloads them.</p>
+              <p className="mt-1 text-xs text-slate-500">Paste a new question set, then Detect.</p>
             </div>
           ) : totalSlots === 0 ? (
             <div className={`${cardClass} p-6 text-center`}>
@@ -1513,6 +1666,14 @@ export default function ExamPaperEditor({
                         {warnings && warnings.length > 0 && (
                           <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold text-amber-700 admin-dark:bg-amber-900/30 admin-dark:text-amber-300">Needs review</span>
                         )}
+                        <button
+                          type="button"
+                          onClick={() => void handleRemoveSlot(index)}
+                          className="rounded-lg border border-red-200 bg-white px-2 py-0.5 text-[10px] font-bold text-red-600 hover:bg-red-50 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
+                          title={`Remove Q${pad(slotNumber)} from this Version/Set`}
+                        >
+                          Remove
+                        </button>
                       </div>
                     </div>
 

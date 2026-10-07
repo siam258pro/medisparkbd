@@ -1,5 +1,5 @@
 import { randomInt } from "node:crypto";
-import { ensureColumn, exec, parseJsonColumn, query } from "@/lib/mysql";
+import { ensureColumn, exec, parseJsonColumn, query, withTransaction } from "@/lib/mysql";
 import { strictAnswerIndex } from "@/lib/paste-mcq-parser";
 
 // Exam Language Version + Set A/B + Question Order Randomization.
@@ -104,17 +104,11 @@ export function isValidVariantContent(
   questionImage?: string | null | undefined,
 ): boolean {
   const text = String(question ?? "").trim();
-  if (text.length < 3 && !questionImage) return false;
+  if (text.length < 3 && !questionImage?.trim()) return false;
   const parsed = parseJsonColumn<unknown[]>(optionsJson ?? "");
   if (!Array.isArray(parsed) || parsed.length < 2) return false;
-  const options = parsed.map((o) => String(o));
-  if (options.some((o) => o.length === 0)) return false;
-  // An unknown answer (null/undefined) is never valid — it must not count
-  // toward set availability and must never resolve to A (index 0).
-  if (correctIndex === null || correctIndex === undefined) return false;
-  const ci = Number(correctIndex);
-  if (!Number.isInteger(ci) || ci < 0 || ci >= options.length) return false;
-  return true;
+  if (parsed.some((o) => typeof o !== "string" || !o.trim())) return false;
+  return strictAnswerIndex(correctIndex, parsed.length) !== null;
 }
 
 /** Number of VALID variant cells for one (exam, version, set). */
@@ -224,6 +218,7 @@ export type VariantRow = {
 /** All variants for one exam, keyed by `${questionId}:${lang}:${set}`. */
 export async function fetchVariantMap(
   examId: string,
+  strict = false,
 ): Promise<Map<string, VariantRow>> {
   const map = new Map<string, VariantRow>();
   try {
@@ -239,8 +234,9 @@ export async function fetchVariantMap(
     for (const row of rows) {
       map.set(`${Number(row.question_id)}:${row.lang}:${row.set_label}`, row);
     }
-  } catch {
-    // No variants — callers fall back to base rows.
+  } catch (error) {
+    if (strict) throw error;
+    // Student legacy reads retain their base-row fallback.
   }
   return map;
 }
@@ -274,10 +270,8 @@ export type BaseQuestionRow = {
 };
 
 /** Preserve an explicit unknown (NULL) — never coerce it to 0/A. */
-function preserveAnswerIndex(value: number | string | null | undefined): number | null {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+function preserveAnswerIndex(value: number | string | null | undefined, optionCount: number): number | null {
+  return strictAnswerIndex(value, optionCount);
 }
 
 /** Resolve displayable marks: finite > 0 wins, else the fallback, else 1. */
@@ -301,8 +295,10 @@ export function overlayVariantOntoBase(
 ): Record<string, unknown> & { hasVariant: boolean } {
   if (!variant) return { ...base, hasVariant: false };
   const parsed = parseJsonColumn<unknown[]>(variant.options);
-  if (!Array.isArray(parsed)) return { ...base, hasVariant: false };
-  const answer = preserveAnswerIndex(variant.correct_index);
+  if (!Array.isArray(parsed) || parsed.length < 2 || parsed.some((o) => typeof o !== "string" || !o.trim())) {
+      return { ...base, hasVariant: false };
+    }
+  const answer = preserveAnswerIndex(variant.correct_index, parsed.length);
   return {
     ...base,
     question: variant.question,
@@ -336,13 +332,13 @@ export function resolveQuestions(
     const variant = variants.get(`${Number(row.id)}:${version}:${set}`);
     if (variant) {
       const parsed = parseJsonColumn<unknown[]>(variant.options);
-      if (Array.isArray(parsed)) {
+      if (Array.isArray(parsed) && parsed.length >= 2 && parsed.every((o) => typeof o === "string" && o.trim())) {
         out.push({
           id: Number(row.id),
           question: variant.question,
           options: parsed.map(String),
           marks: resolveMarks(variant.marks, row.marks),
-          correctIndex: preserveAnswerIndex(variant.correct_index),
+          correctIndex: preserveAnswerIndex(variant.correct_index, parsed.length),
           explanation: variant.explanation ?? null,
           questionImage: variant.question_image ?? null,
           fromVariant: true,
@@ -358,7 +354,7 @@ export function resolveQuestions(
       question: row.question,
       options: parsed.map(String),
       marks: resolveMarks(row.marks, 1),
-      correctIndex: preserveAnswerIndex(row.correct_index),
+      correctIndex: preserveAnswerIndex(row.correct_index, parsed.length),
       explanation: row.explanation ?? null,
       questionImage: (row.question_image as string | null) ?? null,
       fromVariant: false,
@@ -415,41 +411,94 @@ export type VariantInput = {
   questionImage?: string | null;
 };
 
-/** Upsert one variant cell. Throws on validation errors. */
-export async function saveVariant(input: VariantInput): Promise<void> {
-  await ensureVariantTables();
-  const text = (input.question ?? "").trim();
-  if (text.length < 3 && !input.questionImage) {
+function validateVariant(input: VariantInput) {
+  if (!Number.isSafeInteger(input.questionId) || input.questionId <= 0) {
+    throw new Error("A positive question slot ID is required.");
+  }
+  if (!QUESTION_VERSIONS.includes(input.version) || !QUESTION_SETS.includes(input.set)) {
+    throw new Error("Invalid variant language or set.");
+  }
+  const text = typeof input.question === "string" ? input.question.trim() : "";
+  const image = typeof input.questionImage === "string" ? input.questionImage.trim() : null;
+  if (text.length < 3 && !image) {
     throw new Error("Question text or image is required (at least 3 characters or an image).");
   }
-  const options = Array.isArray(input.options) ? input.options.map((o) => String(o)) : [];
-  if (options.length < 2 || options.some((o) => o.length === 0)) {
+  const options = input.options;
+  if (!Array.isArray(options) || options.length < 2 || options.some((o) => typeof o !== "string" || !o.trim())) {
     throw new Error("At least two non-empty options are required.");
   }
-  // Strict: missing/malformed answers are rejected loudly — never stored as A.
-  const strictIndex = strictAnswerIndex(input.correctIndex as unknown, options.length);
+  const strictIndex = strictAnswerIndex(input.correctIndex, options.length);
   if (strictIndex === null) {
     throw new Error("Correct answer is missing or invalid — select A, B, C or D.");
   }
-  const marks = Number(input.marks);
-  const safeMarks = Number.isFinite(marks) && marks > 0 ? marks : 1;
-  await exec(
+  return { text, image, options, strictIndex, marks: resolveMarks(input.marks, 1) };
+}
+
+/**
+ * Upsert one cell inside a caller-owned transaction, so a batch of cells can
+ * commit or roll back as a unit. Call ensureVariantTables() beforehand (DDL
+ * cannot run inside a transaction).
+ */
+export async function saveVariantInTransaction(
+  connection: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
+  input: VariantInput,
+): Promise<void> {
+  const { text, image, options, strictIndex, marks } = validateVariant(input);
+  // Hold the parent lock until the cell is saved so deletion cannot race it.
+  const [slots] = (await connection.query(
+    `SELECT id FROM exam_questions WHERE id = ? AND is_active = 1 FOR UPDATE`,
+    [input.questionId],
+  )) as [{ id: number }[]];
+  if (!slots.length) {
+    throw new Error("Active question slot not found.");
+  }
+  await connection.query(
     `INSERT INTO exam_question_variants
        (question_id, lang, set_label, question, options, correct_index, explanation, marks, question_image)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE question = VALUES(question), options = VALUES(options),
        correct_index = VALUES(correct_index), explanation = VALUES(explanation),
        marks = VALUES(marks), question_image = VALUES(question_image)`,
-    [
-      input.questionId,
-      input.version,
-      input.set,
-      text,
-      JSON.stringify(options),
-      strictIndex,
-      input.explanation ?? null,
-      safeMarks,
-      input.questionImage ?? null,
-    ],
+    [input.questionId, input.version, input.set, text, JSON.stringify(options), strictIndex,
+      input.explanation ?? null, marks, image || null],
   );
+}
+
+/** Upsert only the requested cell of an active permanent slot. */
+export async function saveVariant(input: VariantInput): Promise<void> {
+  validateVariant(input);
+  await ensureVariantTables();
+  await withTransaction((connection) => saveVariantInTransaction(connection, input));
+}
+
+/** Delete one authored variant cell (version/set) without touching the base slot. */
+export async function deleteVariant(
+  questionId: number,
+  version: QuestionVersion,
+  set: QuestionSet,
+): Promise<boolean> {
+  await ensureVariantTables();
+  const { query } = await import("@/lib/mysql");
+  const res = (await query(
+    `DELETE FROM exam_question_variants WHERE question_id = ? AND lang = ? AND set_label = ?`,
+    [questionId, version, set],
+  )) as unknown as { affectedRows?: number };
+  return Number(res?.affectedRows ?? 0) > 0;
+}
+
+/** Delete every authored variant cell for one (exam, version, set). Base slots stay. */
+export async function clearVariantsForExam(
+  examId: string,
+  version: QuestionVersion,
+  set: QuestionSet,
+): Promise<number> {
+  await ensureVariantTables();
+  const { query } = await import("@/lib/mysql");
+  const res = (await query(
+    `DELETE v FROM exam_question_variants v
+     INNER JOIN exam_questions q ON q.id = v.question_id
+     WHERE q.exam_id = ? AND v.lang = ? AND v.set_label = ?`,
+    [examId, version, set],
+  )) as unknown as { affectedRows?: number };
+  return Number(res?.affectedRows ?? 0);
 }

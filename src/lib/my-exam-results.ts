@@ -204,22 +204,6 @@ export async function getStudentResultCards(
       bestRows.map((row) => [row.exam_id, num(row.best)]),
     );
 
-    // Active question ids per exam — breakdown rows for removed questions
-    // are skipped, mirroring the existing detail calculation.
-    const activeRows = await query<{ exam_id: string; id: number }[]>(
-      `SELECT exam_id, id FROM exam_questions
-        WHERE exam_id IN (${examIds.map(() => "?").join(",")}) AND is_active = 1`,
-      examIds,
-    );
-    const activeByExam = new Map<string, Set<number>>();
-    for (const row of activeRows) {
-      let set = activeByExam.get(row.exam_id);
-      if (!set) {
-        set = new Set<number>();
-        activeByExam.set(row.exam_id, set);
-      }
-      set.add(Number(row.id));
-    }
 
     type DetailEntry = {
       questionId?: number;
@@ -238,20 +222,13 @@ export async function getStudentResultCards(
       const details = Array.isArray(rawDetails)
         ? (rawDetails as DetailEntry[])
         : [];
-      const activeIds = activeByExam.get(row.exam_id);
 
       let correct = 0;
       let wrong = 0;
       let unanswered = 0;
       let correctMarks = 0;
       for (const entry of details) {
-        if (
-          typeof entry.questionId === "number" &&
-          activeIds &&
-          !activeIds.has(entry.questionId)
-        ) {
-          continue;
-        }
+
         if (typeof entry.chosenIndex !== "number") {
           unanswered += 1;
         } else if (entry.chosenIndex === entry.correctIndex) {
@@ -402,19 +379,9 @@ export async function getStudentExamResultDetail(
     let unanswered = 0;
 
     if (details.length > 0) {
-      const activeIds = new Set(
-        (
-          await query<{ id: number }[]>(
-            `SELECT id FROM exam_questions WHERE exam_id = ? AND is_active = 1`,
-            [examId],
-          )
-        ).map((row) => Number(row.id)),
-      );
+
       for (const entry of details) {
-        // Skip breakdown rows whose question was removed from the exam.
-        if (typeof entry.questionId === "number" && !activeIds.has(entry.questionId)) {
-          continue;
-        }
+
         if (typeof entry.chosenIndex !== "number") unanswered += 1;
         else if (entry.chosenIndex === entry.correctIndex) correct += 1;
         else wrong += 1;

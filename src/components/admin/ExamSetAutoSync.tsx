@@ -22,6 +22,8 @@ type Q = {
   options: (string | null)[];
   correctOption?: string | null;
   difficulty: string | null;
+  subject?: string;
+  marks?: number;
   explanation?: string | null;
   translationStatus?: string;
   autoTranslated?: boolean;
@@ -95,8 +97,12 @@ export default function ExamSetAutoSync({
         body: JSON.stringify({ action, examId: exam.id, set, ...payload }),
       });
       const d = (await r.json().catch(() => null)) as { error?: string } | null;
-      if (!r.ok) { setError(d?.error ?? "Failed."); return; }
+      if (!r.ok) { setError(d?.error ?? "Failed."); return false; }
       await load(); await loadValidation();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed.");
+      return false;
     } finally { setBusy(false); }
   }
 
@@ -105,38 +111,46 @@ export default function ExamSetAutoSync({
     if (form.question.trim().length < 3) { setError("Question text required (≥3 chars)."); return; }
     if (form.options.some((o) => !o.trim())) { setError("Four non-empty options required."); return; }
     if (editing) {
-      await mutate("update", {
+      const saved = await mutate("update", {
         id: editing.id, topic: form.topic, question: form.question, options: form.options,
         correctOption: form.correctOption, difficulty: form.difficulty,
         explanation: form.explanation, subject: form.subject, marks: Number(form.marks) || 1,
       });
+      if (!saved) return;
     } else {
-      await mutate("create", {
+      const saved = await mutate("create", {
         topic: form.topic, question: form.question, options: form.options,
         correctOption: form.correctOption, difficulty: form.difficulty,
         explanation: form.explanation, subject: form.subject, marks: Number(form.marks) || 1,
       });
+      if (!saved) return;
     }
     setEditing(null);
     setForm({ topic: TOPICS[0], question: "", options: ["", "", "", ""], correctOption: "A", difficulty: "Moderate", explanation: "", subject: "", marks: "1" });
   }
 
   async function regenerate(qid: number) {
-    setBusy(true);
+    setBusy(true); setError(null);
     try {
-      await fetch(`/api/admin/exam-sets/translations`, {
+      const r = await fetch(`/api/admin/exam-sets/translations`, {
         method: "POST", headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ questionId: qid }),
       });
-      await load();
+      const d = await r.json().catch(() => null) as { error?: string } | null;
+      if (!r.ok) { setError(d?.error ?? "Regeneration failed."); return false; }
+      await load(); await loadValidation();
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Regeneration failed.");
+      return false;
     } finally { setBusy(false); }
   }
 
   async function saveManualTranslation() {
     if (!transEdit) return;
-    setBusy(true);
+    setBusy(true); setError(null);
     try {
-      await fetch(`/api/admin/exam-sets/translations`, {
+      const r = await fetch(`/api/admin/exam-sets/translations`, {
         method: "PATCH", headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({
           questionId: transEdit.q.id, question_text: transEdit.text,
@@ -144,7 +158,11 @@ export default function ExamSetAutoSync({
           option_c: transEdit.opts[2], option_d: transEdit.opts[3],
         }),
       });
-      setTransEdit(null); await load();
+      const d = await r.json().catch(() => null) as { error?: string } | null;
+      if (!r.ok) { setError(d?.error ?? "Translation save failed."); return; }
+      setTransEdit(null); await load(); await loadValidation();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Translation save failed.");
     } finally { setBusy(false); }
   }
 
@@ -237,6 +255,7 @@ export default function ExamSetAutoSync({
                 <div>
                   <label className={labelClass}>Answer</label>
                   <select className={inputClass} value={form.correctOption} onChange={(e) => setForm({ ...form, correctOption: e.target.value })}>
+                    <option value="">Select answer</option>
                     {["A", "B", "C", "D"].map((o) => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </div>
@@ -317,8 +336,8 @@ export default function ExamSetAutoSync({
                       setForm({
                         topic: q.topic ?? TOPICS[0], question: q.question ?? "",
                         options: [0, 1, 2, 3].map((i) => q.options[i] ?? ""),
-                        correctOption: q.correctOption ?? "A", difficulty: q.difficulty ?? "Moderate",
-                        explanation: q.explanation ?? "", subject: "", marks: "1",
+                        correctOption: q.correctOption ?? "", difficulty: q.difficulty ?? "Moderate",
+                        explanation: q.explanation ?? "", subject: q.subject ?? "", marks: String(q.marks ?? 1),
                       });
                     }}>Edit</button>
                     <button type="button" className={buttonSecondaryClass} disabled={busy}
@@ -381,7 +400,7 @@ export default function ExamSetAutoSync({
               <div className="mt-3 flex gap-2">
                 <button type="button" className={buttonPrimaryClass} disabled={busy} onClick={() => void saveManualTranslation()}>Save wording</button>
                 <button type="button" className={buttonSecondaryClass} onClick={() => setTransEdit(null)}>Cancel</button>
-                <button type="button" className={buttonSecondaryClass} disabled={busy} onClick={() => { void regenerate(transEdit.q.id); setTransEdit(null); }}>
+                <button type="button" className={buttonSecondaryClass} disabled={busy} onClick={() => { void regenerate(transEdit.q.id).then((ok) => { if (ok) setTransEdit(null); }); }}>
                   Regenerate from master
                 </button>
               </div>

@@ -28,6 +28,7 @@ export async function GET(request: NextRequest) {
   const lang = (request.nextUrl.searchParams.get("lang") ?? "bn").trim().toLowerCase();
   if (!examId) return NextResponse.json({ error: "Missing exam id." }, { status: 400 });
   if (set !== "A" && set !== "B") return NextResponse.json({ error: "Invalid set." }, { status: 400 });
+  if (lang !== "bn" && lang !== "en") return NextResponse.json({ error: "Invalid language." }, { status: 400 });
   try {
     await ensureExamSets(examId);
     const masters = await fetchMasterSet(examId, set);

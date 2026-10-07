@@ -1,5 +1,6 @@
 import { parseJsonColumn, query } from "@/lib/mysql";
 import { normalizeStoredAnswerIndex } from "@/lib/paste-mcq-parser";
+import { getExamResultScript } from "@/lib/exam-taking";
 
 /**
  * Admin → Result Control → Public Exam Result.
@@ -262,6 +263,7 @@ type ResultDetailRow = {
   score: string | number;
   total_marks: string | number;
   answers: string | null;
+  details?: string | null;
   negative_deduction: string | number | null;
   timer_penalty: string | number | null;
   is_second_timer: number | null;
@@ -311,7 +313,7 @@ export async function fetchPublicExamRankedResultsPage(
     try {
       rows = await query<(ResultDetailRow & { auto_submitted?: number | null })[]>(
         `SELECT r.id, r.merit_position, r.student_uid, r.student_name,
-                r.score, r.total_marks, r.answers,
+                r.score, r.total_marks, r.answers, r.details,
                 r.negative_deduction, r.timer_penalty, r.is_second_timer,
                 r.time_taken_seconds, r.submitted_at, r.auto_submitted
             FROM exam_results r
@@ -328,7 +330,7 @@ export async function fetchPublicExamRankedResultsPage(
     } catch {
       rows = await query<ResultDetailRow[]>(
         `SELECT r.id, r.merit_position, r.student_uid, r.student_name,
-                r.score, r.total_marks, r.answers,
+                r.score, r.total_marks, r.answers, r.details,
                 r.negative_deduction, r.timer_penalty, r.is_second_timer,
                 r.time_taken_seconds, r.submitted_at
             FROM exam_results r
@@ -422,7 +424,16 @@ export async function fetchPublicExamRankedResultsPage(
       const rawMarks: number | null = null;
       try {
         const ans = parseJsonColumn<Record<string, number>>(row.answers) ?? {};
-        if (questionMeta.size > 0) {
+        const details = parseJsonColumn<{ chosenIndex: number | null; correctIndex: number | null }[]>(row.details);
+        if (Array.isArray(details) && details.length > 0) {
+          for (const detail of details) {
+            const chosen = normalizeStoredAnswerIndex(detail.chosenIndex);
+            const correctIdx = normalizeStoredAnswerIndex(detail.correctIndex);
+            if (chosen === null) unanswered += 1;
+            else if (correctIdx !== null && chosen === correctIdx) correct += 1;
+            else wrong += 1;
+          }
+        } else if (questionMeta.size > 0) {
           for (const [qid, correctIdx] of questionMeta.entries()) {
             // Per-question lookup by String(qid); values normalized so
             // numeric strings/letters resolve and malformed stays unknown.
@@ -441,7 +452,7 @@ export async function fetchPublicExamRankedResultsPage(
         // Leave zeros
       }
       // If no questionMeta (e.g., exam deleted), keep counts as raw snapshot size.
-      const hasCounts = questionMeta.size > 0;
+      const hasCounts = correct + wrong + unanswered > 0 || questionMeta.size > 0;
       return {
         resultId: row.id,
         rank: row.merit_position ?? null,
@@ -538,16 +549,9 @@ export async function fetchPublicExamStudentResult(
       participantCount = 0;
     }
 
-    // Question order = insertion order of the exam's active questions.
-    const questionRows = await query<
-      { id: number; question: string; options: string; correct_index: number | null; marks: string | number; explanation: string | null }[]
-    >(
-      `SELECT id, question, options, correct_index, marks, explanation
-          FROM exam_questions
-         WHERE exam_id = ? AND is_active = 1
-         ORDER BY id ASC`,
-      [examId],
-    );
+    // Pin the official result ID: a newer practice retake must never replace it.
+    const script = await getExamResultScript(examId, studentUid, null, result.id);
+    if (!script) return null;
 
     // Attempt info (started_at / status) — optional, never fabricated.
     let attemptStatus: string | null = null;
@@ -595,9 +599,6 @@ export async function fetchPublicExamStudentResult(
       // Optional.
     }
 
-    const answers =
-      parseJsonColumn<Record<string, number>>(result.answers) ??
-      ({} as Record<string, number>);
 
     let correctCount = 0;
     let wrongCount = 0;
@@ -613,12 +614,11 @@ export async function fetchPublicExamStudentResult(
       negativePerWrong = meta.negative_enabled ? Math.max(0, Number(meta.negative_per_wrong ?? 0.25) || 0) : 0;
     }
 
-    const questions: AnswerSheetQuestion[] = questionRows.map((row, index) => {
-      const options = parseJsonColumn<string[]>(row.options) ?? [];
-      // Current question's own answer only — never a shared/global value.
-      const chosen = normalizeStoredAnswerIndex(answers[String(row.id)]);
-      const correctIdx = normalizeStoredAnswerIndex(row.correct_index);
-      const marks = toNumber(row.marks) || 1;
+    const questions: AnswerSheetQuestion[] = script.questions.map((row, index) => {
+      const options = row.options;
+      const chosen = row.chosenIndex;
+      const correctIdx = row.correctIndex;
+      const marks = row.marks;
       const status: AnswerSheetQuestion["status"] =
         chosen === null
           ? "unanswered"
@@ -631,7 +631,7 @@ export async function fetchPublicExamStudentResult(
       } else if (status === "wrong") wrongCount += 1;
       else unansweredCount += 1;
       return {
-        questionId: row.id,
+        questionId: row.questionId,
         order: index + 1,
         question: row.question,
         options,

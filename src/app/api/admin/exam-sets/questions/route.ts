@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAnyPermission } from "@/lib/admin";
-import { exec, query } from "@/lib/mysql";
+import { exec, query, withTransaction } from "@/lib/mysql";
+import type { PoolConnection } from "mysql2/promise";
 import {
   allocateQuestionUid,
   correctLetterToIndex,
   ensureAutoSyncTables,
   ensureExamSets,
-  markTranslationStale,
+
   normalizeDifficulty,
   normalizeSyncSet,
   normalizeTopic,
@@ -17,6 +18,19 @@ export const dynamic = "force-dynamic";
 
 function bad(msg: string, status = 400) {
   return NextResponse.json({ error: msg }, { status });
+}
+
+async function renumberSet(connection: PoolConnection, examId: string, set: string) {
+  const [raw] = await connection.query(
+    `SELECT id FROM exam_questions WHERE exam_id = ? AND set_label = ? AND is_active = 1
+      ORDER BY sort_order ASC, id ASC FOR UPDATE`, [examId, set],
+  );
+  const rows = raw as { id: number }[];
+  // Clear old positions first to avoid transient unique-slot collisions.
+  await connection.query(`UPDATE exam_questions SET sort_order = NULL WHERE exam_id = ? AND set_label = ? AND is_active = 1`, [examId, set]);
+  for (let i = 0; i < rows.length; i += 1) {
+    await connection.query(`UPDATE exam_questions SET sort_order = ? WHERE id = ?`, [i + 1, rows[i].id]);
+  }
 }
 
 /**
@@ -30,60 +44,75 @@ export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body) return bad("Invalid body.");
   const action = String(body.action ?? "create").toLowerCase();
+  if (!["create", "update", "delete", "reorder", "move-set"].includes(action)) return bad("Invalid action.");
+  const requestExamId = String(body.examId ?? "").trim();
+  if (!requestExamId) return bad("examId is required.");
   try {
     await ensureAutoSyncTables();
     if (action === "reorder") {
       const examId = String(body.examId ?? "").trim();
       const set = normalizeSyncSet(body.set);
-      const order = Array.isArray(body.order) ? body.order.map(Number).filter((n) => Number.isInteger(n)) : [];
-      if (!examId || !set || order.length === 0) return bad("examId, set and order[] are required.");
-      for (let i = 0; i < order.length; i += 1) {
-        await exec(`UPDATE exam_questions SET sort_order = ? WHERE id = ? AND exam_id = ? AND set_label = ?`, [i + 1, order[i], examId, set]);
-        void markTranslationStale(order[i]).catch(() => {});
-      }
+      const order = Array.isArray(body.order) ? body.order.map(Number) : [];
+      if (!examId || !set || order.length === 0 || order.some((id) => !Number.isSafeInteger(id) || id <= 0)
+        || new Set(order).size !== order.length) return bad("A complete, unique order of positive question IDs is required.");
+      const reordered = await withTransaction(async (connection) => {
+        const [raw] = await connection.query(
+          `SELECT id FROM exam_questions WHERE exam_id = ? AND set_label = ? AND is_active = 1 FOR UPDATE`, [examId, set],
+        );
+        const rows = raw as { id: number }[];
+        const ids = new Set(rows.map((row) => Number(row.id)));
+        if (rows.length !== order.length || order.some((id) => !ids.has(id))) return false;
+        await connection.query(`UPDATE exam_questions SET sort_order = NULL WHERE exam_id = ? AND set_label = ? AND is_active = 1`, [examId, set]);
+        for (let i = 0; i < order.length; i += 1) {
+          await connection.query(`UPDATE exam_questions SET sort_order = ? WHERE id = ? AND exam_id = ? AND set_label = ? AND is_active = 1`, [i + 1, order[i], examId, set]);
+        }
+        return true;
+      });
+      if (!reordered) return bad("order[] must contain every active question in this exam/set exactly once.");
       return NextResponse.json({ ok: true });
     }
     if (action === "delete") {
       const id = Number(body.id);
-      if (!Number.isInteger(id)) return bad("Missing question id.");
-      await exec(`UPDATE exam_questions SET is_active = 0 WHERE id = ?`, [id]);
-      void markTranslationStale(id).catch(() => {});
+      const set = normalizeSyncSet(body.set);
+      if (!Number.isSafeInteger(id) || id <= 0 || !set) return bad("id and set are required.");
+      const deleted = await withTransaction(async (connection) => {
+        const [result] = await connection.query(
+          `UPDATE exam_questions SET is_active = 0, sort_order = NULL WHERE id = ? AND exam_id = ? AND set_label = ? AND is_active = 1`,
+          [id, requestExamId, set],
+        );
+        if (!(result as { affectedRows: number }).affectedRows) return false;
+        await renumberSet(connection, requestExamId, set);
+        return true;
+      });
+      if (!deleted) return bad("Active question not found in this exam/set.", 404);
       return NextResponse.json({ ok: true });
     }
     if (action === "move-set") {
       const id = Number(body.id);
       const set = normalizeSyncSet(body.set);
-      if (!Number.isInteger(id) || !set) return bad("id and set are required.");
-      const rows = await query<{ exam_id: string; question_uid: string | null }[]>(
-        `SELECT exam_id, question_uid FROM exam_questions WHERE id = ? LIMIT 1`, [id],
-      );
-      const row = rows[0];
-      if (!row) return bad("Question not found.", 404);
-      if (row.question_uid) {
-        const dup = await query<{ id: number }[]>(
-          `SELECT id FROM exam_questions WHERE exam_id = ? AND question_uid = ? AND set_label != (SELECT set_label FROM exam_questions WHERE id = ?) AND is_active = 1 LIMIT 1`,
-          [row.exam_id, row.question_uid, id],
+      if (!Number.isSafeInteger(id) || id <= 0 || !set) return bad("id and set are required.");
+      const moved = await withTransaction(async (connection) => {
+        const [raw] = await connection.query(
+          `SELECT set_label, sort_order FROM exam_questions WHERE id = ? AND exam_id = ? AND is_active = 1 FOR UPDATE`, [id, requestExamId],
         );
-        void dup;
-      }
-      // Disjoint guard: the uid is unique to its row; moving keeps one home.
-      const examId = row.exam_id;
-      const targetRows = await query<{ n: number }[]>(
-        `SELECT COUNT(*) AS n FROM exam_questions WHERE exam_id = ? AND set_label = ? AND is_active = 1`, [examId, set],
-      );
-      void targetRows;
-      // Renumber within target set (append at end).
-      const maxRows = await query<{ m: number | null }[]>(
-        `SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ? AND set_label = ? AND is_active = 1`, [examId, set],
-      );
-      const nextOrder = (Number(maxRows[0]?.m) || 0) + 1;
-      await exec(`UPDATE exam_questions SET set_label = ?, sort_order = ? WHERE id = ?`, [set, nextOrder, id]);
-      void markTranslationStale(id).then(() => syncTranslationFor(id)).catch(() => {});
-      return NextResponse.json({ ok: true, set, sortOrder: nextOrder });
+        const row = (raw as { set_label: string | null; sort_order: number }[])[0];
+        if (!row || !row.set_label) return null;
+        if (row.set_label === set) return row.sort_order;
+        const [maxRows] = await connection.query(
+          `SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ? AND set_label = ? AND is_active = 1`, [requestExamId, set],
+        );
+        const nextOrder = (Number((maxRows as { m: number | null }[])[0]?.m) || 0) + 1;
+        await connection.query(`UPDATE exam_questions SET set_label = ?, sort_order = ? WHERE id = ? AND exam_id = ? AND is_active = 1`, [set, nextOrder, id, requestExamId]);
+        await renumberSet(connection, requestExamId, row.set_label);
+        return nextOrder;
+      });
+      if (moved === null) return bad("Active question not found in this exam.", 404);
+      return NextResponse.json({ ok: true, set, sortOrder: moved });
     }
     if (action === "update") {
       const id = Number(body.id);
-      if (!Number.isInteger(id)) return bad("Missing question id.");
+      const set = normalizeSyncSet(body.set);
+      if (!Number.isSafeInteger(id) || id <= 0 || !set) return bad("id and set are required.");
       const topic = body.topic !== undefined ? normalizeTopic(body.topic) : undefined;
       if (body.topic !== undefined && !topic) return bad("Invalid topic.");
       const difficulty = body.difficulty !== undefined
@@ -96,10 +125,13 @@ export async function POST(request: NextRequest) {
       if (body.correctOption !== undefined && correctLetter === null) return bad("correctOption must be A/B/C/D.");
       const sets: string[] = [];
       const params: unknown[] = [];
-      if (body.question !== undefined) { sets.push(`question = ?`); params.push(String(body.question)); }
+      if (body.question !== undefined) {
+        if (typeof body.question !== "string" || body.question.trim().length < 3) return bad("Question text is required (at least 3 characters).");
+        sets.push(`question = ?`); params.push(body.question.trim());
+      }
       if (body.options !== undefined) {
-        const opts = Array.isArray(body.options) ? body.options.map(String) : null;
-        if (!opts || opts.length < 4 || opts.slice(0, 4).some((o) => !o.trim())) return bad("Four non-empty options are required.");
+        const opts = Array.isArray(body.options) ? body.options : null;
+        if (!opts || opts.length !== 4 || opts.some((o) => typeof o !== "string" || !o.trim())) return bad("Four non-empty options are required.");
         sets.push(`options = ?`); params.push(JSON.stringify(opts.slice(0, 4)));
       }
       if (correctLetter !== undefined) { sets.push(`correct_index = ?`); params.push(correctLetter); }
@@ -109,10 +141,17 @@ export async function POST(request: NextRequest) {
       if (body.marks !== undefined) { sets.push(`marks = ?`); params.push(Number(body.marks) || 1); }
       if (body.subject !== undefined) { sets.push(`bank_subject = ?`); params.push(String(body.subject)); }
       if (sets.length === 0) return bad("Nothing to update.");
-      params.push(id);
-      await exec(`UPDATE exam_questions SET ${sets.join(", ")} WHERE id = ?`, params);
-      await exec(`UPDATE question_translations SET translation_status = 'needs_update' WHERE question_id = ? AND translation_status != 'manually_edited'`, [id]);
-      // Queue regeneration without blocking the admin UI.
+      params.push(id, requestExamId, set);
+      const updated = await withTransaction(async (connection) => {
+        const [result] = await connection.query(
+          `UPDATE exam_questions SET ${sets.join(", ")} WHERE id = ? AND exam_id = ? AND set_label = ? AND is_active = 1`, params,
+        );
+        if (!(result as { affectedRows: number }).affectedRows) return false;
+        await connection.query(`UPDATE question_translations SET translation_status = 'needs_update' WHERE question_id = ? AND language = 'en' AND translation_status != 'manually_edited'`, [id]);
+        return true;
+      });
+      if (!updated) return bad("Active question not found in this exam/set.", 404);
+      // Queue only after the master edit and stale marker commit together.
       void syncTranslationFor(id).catch(() => {});
       return NextResponse.json({ ok: true, translation: "queued" });
     }
@@ -125,8 +164,8 @@ export async function POST(request: NextRequest) {
     if (!topic) return bad("topic must be one of Cell Structure, Cell Division, Cell Chemistry, Microorganisms.");
     const qText = String(body.question ?? "").trim();
     if (qText.length < 3) return bad("Question text is required (at least 3 characters).");
-    const opts = Array.isArray(body.options) ? body.options.map((o: unknown) => String(o)) : [];
-    if (opts.length < 4 || opts.slice(0, 4).some((o) => !o.trim())) return bad("Four non-empty options are required.");
+    const opts = Array.isArray(body.options) ? body.options : [];
+    if (opts.length !== 4 || opts.some((o) => typeof o !== "string" || !o.trim())) return bad("Four non-empty options are required.");
     const correct = correctLetterToIndex(body.correctOption);
     if (correct === null) return bad("correctOption must be A/B/C/D.");
     const difficulty = body.difficulty === undefined || body.difficulty === null

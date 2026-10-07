@@ -17,6 +17,20 @@ describe("exam auto-sync core rules", () => {
     assert.equal(correctLetterToIndex("Z"), null);
   });
 
+  it("missing, blank and boolean answers never become A", () => {
+    for (const value of [null, undefined, "", "  ", false, true, [], {}]) {
+      assert.equal(correctLetterToIndex(value), null);
+      assert.equal(correctIndexToLetter(value), null);
+    }
+    for (const value of [-1, 4, 1.5, Infinity, NaN]) {
+      assert.equal(correctLetterToIndex(value), null);
+      assert.equal(correctIndexToLetter(value), null);
+    }
+    assert.equal(correctLetterToIndex(0), 0);
+    assert.equal(correctLetterToIndex("0"), 0);
+    assert.equal(correctIndexToLetter("2"), "C");
+  });
+
   it("sets, topics and difficulties normalize strictly", () => {
     assert.equal(normalizeSyncSet("Set A"), "A");
     assert.equal(normalizeSyncSet("b"), "B");

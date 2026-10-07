@@ -507,7 +507,7 @@ export default function ExamManager({
         return;
       }
       const qc = Number((form as unknown as Record<string, unknown>).questionCount);
-      if (!Number.isFinite(qc) || qc <= 0 || qc > 500) {
+      if (!Number.isInteger(qc) || qc <= 0 || qc > 500) {
         setNotice({ kind: "error", text: "Total Questions must be between 1 and 500." });
         return;
       }
@@ -710,7 +710,8 @@ export default function ExamManager({
       const response = await fetch("/api/admin/exams/duplicate", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...gate.headers },
-        body: JSON.stringify({ id }),
+        // One operation key per confirmed click so a replayed request cannot create a second copy.
+        body: JSON.stringify({ id, requestId: crypto.randomUUID() }),
       });
       const data = (await response.json().catch(() => null)) as { error?: string; exam?: Exam } | null;
       if (!response.ok) {

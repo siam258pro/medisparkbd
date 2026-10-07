@@ -151,8 +151,13 @@ export async function DELETE(request: NextRequest) {
   if (typeof body?.id !== "string" || !body.id) {
     return NextResponse.json({ error: "Missing exam id." }, { status: 400 });
   }
-  await deleteExam(body.id);
-  await logAdminAction(admin, "exam.delete", `id=${body.id}`, request);
-  const exams = await fetchExams();
-  return NextResponse.json({ exams });
+  try {
+    await deleteExam(body.id);
+    await logAdminAction(admin, "exam.delete", `id=${body.id}`, request);
+    const exams = await fetchExams();
+    return NextResponse.json({ exams });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to delete the exam.";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
 }

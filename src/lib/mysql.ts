@@ -73,6 +73,25 @@ function isTransientDbError(code?: string): boolean {
   );
 }
 
+/**
+ * A connection can drop AFTER the server committed a write (lost ACK). Only
+ * statements that are safe to repeat may be retried; a blind retry of a plain
+ * INSERT (or a counter UPDATE) would silently duplicate/double-apply it.
+ */
+function isRetrySafeWrite(sql: string): boolean {
+  const text = sql.trim().replace(/\s+/g, " ");
+  const upper = text.toUpperCase();
+  if (/^(CREATE|ALTER|DROP|DELETE|REPLACE|SET|TRUNCATE)\b/.test(upper)) return true;
+  if (upper.startsWith("INSERT")) {
+    return /^INSERT\s+IGNORE\b/.test(upper) || upper.includes("ON DUPLICATE KEY UPDATE");
+  }
+  if (upper.startsWith("UPDATE")) {
+    // `col = col + 1` style updates are not idempotent.
+    return !/\b(\w+)`?\s*=\s*`?\1`?\s*[-+*/]/i.test(text);
+  }
+  return false;
+}
+
 // Simple in-memory query cache for GET requests (invalidated on mutations).
 // Bounded LRU: evicts the oldest entry once full so long-lived serverless
 // instances never grow memory unboundedly.
@@ -179,7 +198,7 @@ export async function exec(
       return result;
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
-      if (isTransientDbError(code) && attempt === 0) {
+      if (isTransientDbError(code) && attempt === 0 && isRetrySafeWrite(sql)) {
         await new Promise((r) => setTimeout(r, 300 + Math.random() * 400));
         continue;
       }

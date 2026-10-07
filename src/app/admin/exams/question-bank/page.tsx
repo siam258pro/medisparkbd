@@ -69,9 +69,14 @@ export default function QuestionBankPage() {
       setNotice({ kind: "error", text: "Question text must be 3–5000 characters." });
       return;
     }
-    const filledOptions = form.options.filter((o) => o.trim().length > 0);
+    const filledOptions = form.options.map((text, index) => ({ text: text.trim(), index })).filter((option) => option.text.length > 0);
     if (filledOptions.length < 2) {
       setNotice({ kind: "error", text: "Fill in at least 2 options." });
+      return;
+    }
+    const correctIndex = filledOptions.findIndex((option) => option.index === form.correctIndex);
+    if (correctIndex < 0) {
+      setNotice({ kind: "error", text: "Select a correct answer with non-empty option text." });
       return;
     }
     if (form.options.some((o) => o.length > 2000)) {
@@ -79,7 +84,7 @@ export default function QuestionBankPage() {
       return;
     }
     const marks = Number(form.marks);
-    if (!Number.isFinite(marks) || marks <= 0 || marks > 100) {
+    if (!Number.isFinite(marks) || marks < 0.5 || marks > 100) {
       setNotice({ kind: "error", text: "Marks must be between 0.5 and 100." });
       return;
     }
@@ -96,7 +101,9 @@ export default function QuestionBankPage() {
         body: JSON.stringify({
           ...(editingId ? { id: editingId } : {}),
           ...form,
-          marks: Number(form.marks) || 1,
+          options: filledOptions.map((option) => option.text),
+          correctIndex,
+          marks,
         }),
       });
       const data = (await response.json().catch(() => null)) as { error?: string } | null;

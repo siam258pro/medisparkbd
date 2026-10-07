@@ -4,7 +4,7 @@ import { submitExamAttempt } from "@/lib/exam-taking";
 
 export const dynamic = "force-dynamic";
 
-type SubmitBody = { answers?: Record<string, unknown> };
+type SubmitBody = { answers?: Record<string, unknown>; token?: unknown };
 
 /** POST /api/exams/[id]/submit — grade answers and store the result. */
 export async function POST(
@@ -17,8 +17,12 @@ export async function POST(
   }
 
   const body = (await request.json().catch(() => null)) as SubmitBody | null;
-  if (!body || typeof body.answers !== "object" || body.answers === null) {
+  if (!body || typeof body.answers !== "object" || body.answers === null || Array.isArray(body.answers)) {
     return NextResponse.json({ error: "Missing answers." }, { status: 400 });
+  }
+
+  if (typeof body.token !== "string" || !body.token) {
+    return NextResponse.json({ error: "Missing attempt token. Resume the exam and retry." }, { status: 400 });
   }
 
   // Keep only valid selections: question IDs as numeric-string keys, and
@@ -34,12 +38,21 @@ export async function POST(
   }
 
   const { id } = await context.params;
-  const outcome = await submitExamAttempt(
-    id,
-    user.uid,
-    user.name || user.email || "Student",
-    answers,
-  );
+  let outcome;
+  try {
+    outcome = await submitExamAttempt(
+      id,
+      user.uid,
+      user.name || user.email || "Student",
+      answers,
+      body.token,
+    );
+  } catch {
+    return NextResponse.json(
+      { error: "Could not save your result. Please retry; your attempt and saved answers are retained.", transient: true },
+      { status: 503 },
+    );
+  }
   if (!outcome) {
     return NextResponse.json(
       { error: "Exam not found or not available." },

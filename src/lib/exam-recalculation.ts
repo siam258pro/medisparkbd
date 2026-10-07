@@ -5,7 +5,7 @@ import {
   normalizeSet,
   normalizeVersion,
   resolveMarks,
-  type VariantRow,
+  resolveQuestions,
 } from "@/lib/exam-variants";
 import { normalizeStoredAnswerIndex } from "@/lib/paste-mcq-parser";
 import {
@@ -131,127 +131,14 @@ type RecalcDetail = {
   correctIndex: number | null;
   marks: number;
   obtained: number;
+  question?: string;
+  options?: string[];
+  explanation?: string | null;
+  questionImage?: string | null;
+  gradingSource?: "base" | "variant";
+  questionVersion?: string;
+  assignedSet?: string;
 };
-
-type EffectiveAnswer = { correct: number | null; marks: number };
-
-/**
- * Effective grading values of one key family for every active question —
- * the exact submit-time fallback: a variant cell counts only when its
- * options parse (else base wins), same as `resolveQuestions`.
- */
-function effectiveMap(
-  baseRows: { id: number; correct_index: number | null; marks: string | number; options: string }[],
-  variantMap: Map<string, VariantRow>,
-  version: string | null,
-  set: string | null,
-): Map<number, EffectiveAnswer> {
-  const out = new Map<number, EffectiveAnswer>();
-  for (const r of baseRows) {
-    const qid = Number(r.id);
-    const baseMarks = resolveMarks(r.marks, 1);
-    // Unparseable base options grade nothing — same as resolveQuestions,
-    // which drops such rows instead of guessing.
-    if (!Array.isArray(parseJsonColumn<unknown[]>(r.options))) continue;
-    if (!version || !set) {
-      out.set(qid, {
-        correct: normalizeStoredAnswerIndex(r.correct_index),
-        marks: baseMarks,
-      });
-      continue;
-    }
-    const cell = variantMap.get(`${qid}:${version}:${set}`);
-    const parsed = cell ? parseJsonColumn<unknown[]>(cell.options) : null;
-    if (cell && Array.isArray(parsed)) {
-      out.set(qid, {
-        correct: normalizeStoredAnswerIndex(cell.correct_index),
-        marks: resolveMarks(cell.marks, r.marks),
-      });
-    } else {
-      out.set(qid, {
-        correct: normalizeStoredAnswerIndex(r.correct_index),
-        marks: baseMarks,
-      });
-    }
-  }
-  return out;
-}
-
-/**
- * Prove which key family graded one stored result:
- * own snapshot wins; otherwise majority vote of the grading-time correct
- * answers. Tied families grade identically (e.g. Set B shares answers
- * across languages) and are interchangeable; anything else is skipped.
- * Self-contained per result — a later retake can never poison it.
- */
-function voteMapping(
-  detailsList: RecalcDetail[],
-  baseRows: { id: number; correct_index: number | null; marks: string | number; options: string }[],
-  variantMap: Map<string, VariantRow>,
-): { version: string; set: string } | { base: true } | null {
-  const known = detailsList.filter(
-    (d) =>
-      typeof d.questionId === "number" &&
-      d.correctIndex !== null &&
-      d.correctIndex !== undefined,
-  );
-  if (known.length < 5) return null;
-  const families: ({ version: string; set: string } | { base: true })[] = [
-    { base: true },
-    { version: "bangla", set: "A" },
-    { version: "bangla", set: "B" },
-    { version: "english", set: "A" },
-    { version: "english", set: "B" },
-  ];
-  const eff = families.map((f) =>
-    "base" in f
-      ? effectiveMap(baseRows, variantMap, null, null)
-      : effectiveMap(baseRows, variantMap, f.version, f.set),
-  );
-  let bestIdx = -1;
-  let bestHits = -1;
-  let bestTotal = 0;
-  const scored = eff.map((map) => {
-    let hits = 0;
-    let total = 0;
-    for (const d of known) {
-      const cellEff = map.get(Number(d.questionId));
-      if (!cellEff) continue;
-      total += 1;
-      if (cellEff.correct === Number(d.correctIndex)) hits += 1;
-    }
-    return { hits, total };
-  });
-  for (let i = 0; i < scored.length; i += 1) {
-    // Families with too few gradable questions cannot win.
-    if (scored[i].total < 5) continue;
-    if (scored[i].hits > bestHits) {
-      bestIdx = i;
-      bestHits = scored[i].hits;
-      bestTotal = scored[i].total;
-    }
-  }
-  if (bestIdx === -1 || bestTotal === 0 || bestHits / bestTotal < 0.6) {
-    return null;
-  }
-  // Every family tied at the top must grade identically — else skip.
-  const winner = eff[bestIdx];
-  for (let i = 0; i < scored.length; i += 1) {
-    if (i === bestIdx || scored[i].total < 5 || scored[i].hits !== bestHits) continue;
-    const other = eff[i];
-    let identical = true;
-    for (const r of baseRows) {
-      const a = winner.get(Number(r.id));
-      const b = other.get(Number(r.id));
-      if (!a || !b || a.correct !== b.correct || a.marks !== b.marks) {
-        identical = false;
-        break;
-      }
-    }
-    if (!identical) return null;
-  }
-  return families[bestIdx];
-}
 
 /**
  * Recompute every stored result of one exam from immutable student answers
@@ -271,20 +158,15 @@ export async function recalculateExamResults(
   );
 
   const baseRows = await query<
-    { id: number; correct_index: number | null; marks: string | number; options: string }[]
+    { id: number; question: string; correct_index: number | null; marks: string | number; options: string; explanation: string | null; question_image?: string | null }[]
   >(
-    `SELECT id, correct_index, marks, options FROM exam_questions
+    `SELECT id, question, correct_index, marks, options, explanation, question_image FROM exam_questions
       WHERE exam_id = ? AND is_active = 1 ORDER BY sort_order ASC, id ASC`,
     [id],
   );
   if (baseRows.length === 0) return { recalculated: 0, skipped: 0 };
 
-  let variantMap = new Map<string, VariantRow>();
-  try {
-    variantMap = await fetchVariantMap(id);
-  } catch {
-    variantMap = new Map<string, VariantRow>();
-  }
+  const variantMap = await fetchVariantMap(id, true);
 
   const results = await query<StoredResultRow[]>(
     `SELECT id, answers, details, timer_penalty, question_version, assigned_set
@@ -308,45 +190,68 @@ export async function recalculateExamResults(
       const storedDetails = parseJsonColumn<RecalcDetail[]>(result.details);
       const detailsList = Array.isArray(storedDetails) ? storedDetails : [];
 
-      const snapVersion = normalizeVersion(result.question_version);
-      const snapSet = normalizeSet(
-        typeof result.assigned_set === "string" ? result.assigned_set : null,
-      );
+      // Without an original option snapshot, a current numeric key cannot be
+      // safely applied (options may have moved). Leave legacy rows untouched.
+      if (detailsList.length === 0 || detailsList.some((d) =>
+        !d || typeof d.question !== "string" || !Array.isArray(d.options) ||
+        (d.gradingSource !== "base" && d.gradingSource !== "variant")
+      )) {
+        skipped += 1;
+        continue;
+      }
+      const snapVersion = normalizeVersion(result.question_version ?? detailsList[0].questionVersion);
+      const snapSet = normalizeSet(result.assigned_set ?? detailsList[0].assignedSet);
       const mapping =
         snapVersion && snapSet
           ? { version: snapVersion, set: snapSet } as const
-          : voteMapping(detailsList, baseRows, variantMap);
+          : null;
       if (!mapping) {
         skipped += 1;
         continue;
       }
-      const eff =
-        "base" in mapping
-          ? effectiveMap(baseRows, variantMap, null, null)
-          : effectiveMap(baseRows, variantMap, mapping.version, mapping.set);
+      const originalIds = new Set(detailsList.map((d) => d.questionId));
+      if (originalIds.size !== detailsList.length) {
+        skipped += 1;
+        continue;
+      }
+      const baseById = new Map(baseRows.map((r) => [Number(r.id), r]));
+      const corrected = new Map<number, number | null>();
+      for (const detail of detailsList) {
+        const base = baseById.get(detail.questionId);
+        if (!base) break;
+        const version = "base" in mapping ? "bangla" : mapping.version;
+        const set = "base" in mapping ? "A" : mapping.set;
+        const live = resolveQuestions([base], detail.gradingSource === "base" ? new Map() : variantMap, version as "bangla" | "english", set as "A" | "B")[0];
+        if (!live || (detail.gradingSource === "variant" && !live.fromVariant) ||
+            live.question !== detail.question || JSON.stringify(live.options) !== JSON.stringify(detail.options) ||
+            (live.questionImage ?? null) !== (detail.questionImage ?? null)) break;
+        corrected.set(detail.questionId, live.correctIndex);
+      }
+      if (corrected.size !== detailsList.length) {
+        skipped += 1;
+        continue;
+      }
 
       let score = 0;
       let wrongCount = 0;
       let totalMarks = 0;
       const details: RecalcDetail[] = [];
-      for (const r of baseRows) {
-        const qid = Number(r.id);
-        const cellEff = eff.get(qid);
-        if (!cellEff) continue;
-        totalMarks += cellEff.marks;
-        const chosen = normalizeStoredAnswerIndex(answers[String(qid)]);
-        if (chosen === null) {
-          details.push({ questionId: qid, chosenIndex: null, correctIndex: cellEff.correct, marks: cellEff.marks, obtained: 0 });
-          continue;
+      for (const original of detailsList) {
+        const qid = original.questionId;
+        const correctIndex = corrected.get(qid) ?? null;
+        const marks = resolveMarks(original.marks, 1);
+        totalMarks += marks;
+        const chosen = normalizeStoredAnswerIndex(answers[String(qid)] ?? original.chosenIndex);
+        let obtained = 0;
+        if (chosen !== null) {
+          if (correctIndex !== null && chosen === correctIndex) obtained = marks;
+          else {
+            obtained = -negativePerWrong;
+            wrongCount += 1;
+          }
         }
-        if (cellEff.correct !== null && chosen === cellEff.correct) {
-          score += cellEff.marks;
-          details.push({ questionId: qid, chosenIndex: chosen, correctIndex: cellEff.correct, marks: cellEff.marks, obtained: cellEff.marks });
-        } else {
-          score -= negativePerWrong;
-          wrongCount += 1;
-          details.push({ questionId: qid, chosenIndex: chosen, correctIndex: cellEff.correct, marks: cellEff.marks, obtained: -negativePerWrong });
-        }
+        score += obtained;
+        details.push({ ...original, chosenIndex: chosen, correctIndex, marks, obtained });
       }
       score = Math.max(0, Math.round(score * 100) / 100);
       totalMarks = Math.round(totalMarks * 100) / 100;
@@ -358,13 +263,14 @@ export async function recalculateExamResults(
       const timerPenalty = Number.isFinite(timerPenaltyRaw) && timerPenaltyRaw > 0 ? timerPenaltyRaw : 0;
       const finalScore = Math.max(0, Math.round((score - timerPenalty) * 100) / 100);
 
-      await exec(
+      const updated = await exec(
         `UPDATE exam_results
             SET score = ?, total_marks = ?, details = ?, negative_deduction = ?
-          WHERE id = ?`,
-        [finalScore, totalMarks, JSON.stringify(details), negativeDeduction, result.id],
+          WHERE id = ? AND details <=> ?`,
+        [finalScore, totalMarks, JSON.stringify(details), negativeDeduction, result.id, result.details],
       );
-      rewritten += 1;
+      if (updated.affectedRows === 1) rewritten += 1;
+      else skipped += 1;
     } catch {
       // One bad row never blocks the rest; count it as skipped.
       skipped += 1;

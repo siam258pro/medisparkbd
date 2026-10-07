@@ -84,7 +84,7 @@ function harness(
       if (/INSERT INTO exam_results\s/.test(sql)) {
         const columns = sql.match(/exam_results\s*\(([^)]+)\)/)![1].split(",").map((value) => value.trim());
         if (liveEnum && params[columns.indexOf("attempt_type")] === "scheduled") {
-          throw new Error("Data truncated for attempt_type: enum('live','practice')");
+          throw Object.assign(new Error("Data truncated for attempt_type: enum('live','practice')"), { code: "WARN_DATA_TRUNCATED" });
         }
         result = Object.fromEntries(columns.map((column, index) => [column, params[index]]));
         if (liveEnum && !columns.includes("attempt_type")) result.attempt_type = "live";
@@ -92,7 +92,11 @@ function harness(
       }
       return { affectedRows: 1 };
     },
-    withTransaction: async (work: (connection: unknown) => Promise<void>) => work({ query: async () => [[]] }),
+    withTransaction: async (work: (connection: unknown) => Promise<unknown>) => work({
+      query: async (sql: string, params: unknown[] = []) => [
+        /^\s*SELECT/.test(sql) ? await mysql.query(sql, params) : await mysql.exec(sql, params),
+      ],
+    }),
   };
   const variantModule = loadServer<typeof import("../src/lib/exam-variants.ts")>("src/lib/exam-variants.ts", {
     "@/lib/mysql": mysql, "@/lib/paste-mcq-parser": parser,

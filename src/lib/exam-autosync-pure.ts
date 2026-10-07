@@ -50,13 +50,15 @@ export function normalizeDifficulty(v: unknown): Difficulty | null {
 export function correctLetterToIndex(letter: unknown): number | null {
   const t = String(letter ?? "").trim().toUpperCase();
   const map: Record<string, number> = { A: 0, B: 1, C: 2, D: 3 };
-  if (t in map) return map[t];
+  if (Object.hasOwn(map, t)) return map[t];
+  if (typeof letter !== "number" && (typeof letter !== "string" || !letter.trim())) return null;
   const n = Number(letter);
   if (Number.isInteger(n) && n >= 0 && n <= 3) return n;
   return null;
 }
 
 export function correctIndexToLetter(index: unknown): "A" | "B" | "C" | "D" | null {
+  if (typeof index !== "number" && (typeof index !== "string" || !index.trim())) return null;
   const n = Number(index);
   if (!Number.isInteger(n) || n < 0 || n > 3) return null;
   return (["A", "B", "C", "D"] as const)[n];

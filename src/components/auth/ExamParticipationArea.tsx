@@ -185,7 +185,7 @@ export default function ExamParticipationArea({
   const expiresAtRef = useRef<number | null>(null);
   const serverOffsetRef = useRef(0);
   const begunRef = useRef(false);
-  const pendingKey = `exam-pending-${examId}`;
+  const pendingKey = `exam-pending-${user?.uid ?? "anonymous"}-${examId}`;
 
   /** Apply authoritative timing from the backend (expires_at + server_now). */
   const applyServerTiming = useCallback(
@@ -222,7 +222,7 @@ export default function ExamParticipationArea({
   /** Load locally queued offline answers (pending_sync). */
   const loadPending = useCallback((): Record<string, number> => {
     try {
-      const raw = window.localStorage.getItem(pendingKey);
+      const raw = window.localStorage.getItem(`${pendingKey}:${tokenRef.current}`);
       if (!raw) return {};
       const parsed = JSON.parse(raw) as Record<string, number>;
       return parsed && typeof parsed === "object" ? parsed : {};
@@ -234,8 +234,8 @@ export default function ExamParticipationArea({
   const savePending = useCallback(
     (pending: Record<string, number>) => {
       try {
-        if (Object.keys(pending).length === 0) window.localStorage.removeItem(pendingKey);
-        else window.localStorage.setItem(pendingKey, JSON.stringify(pending));
+        if (Object.keys(pending).length === 0) window.localStorage.removeItem(`${pendingKey}:${tokenRef.current}`);
+        else window.localStorage.setItem(`${pendingKey}:${tokenRef.current}`, JSON.stringify(pending));
       } catch {}
     },
     [pendingKey],
@@ -260,6 +260,7 @@ export default function ExamParticipationArea({
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
           body: JSON.stringify({
+            token: tokenRef.current,
             answers: Object.fromEntries(
               Object.entries(answersRef.current).map(([key, value]) => [
                 key,
@@ -275,7 +276,7 @@ export default function ExamParticipationArea({
       if ("score" in data) {
         // Backend is authoritative: it flags autoSubmitted when now >= expires_at.
         try {
-          window.localStorage.removeItem(pendingKey);
+          window.localStorage.removeItem(`${pendingKey}:${tokenRef.current}`);
         } catch {}
         setOutcome(isAuto ? { ...data, autoSubmitted: true } : data);
       } else {
@@ -301,7 +302,7 @@ export default function ExamParticipationArea({
       if (!token || !user || submittedRef.current) return;
       let pending: Record<string, number> = {};
       try {
-        const raw = window.localStorage.getItem(pendingKey);
+        const raw = window.localStorage.getItem(`${pendingKey}:${token}`);
         if (!raw) return;
         const parsed = JSON.parse(raw) as Record<string, number>;
         if (!parsed || typeof parsed !== "object") return;
@@ -376,10 +377,9 @@ export default function ExamParticipationArea({
           if (Number.isInteger(qid) && Number.isInteger(v as number)) restored[qid] = v as number;
         }
       }
-      // Merge offline pending_sync answers (local wins only for questions the
-      // server has not yet stored — never overwrites newer server answers).
+      // Merge only this student's current attempt; old retake queues are isolated.
       try {
-        const raw = window.localStorage.getItem(pendingKey);
+        const raw = window.localStorage.getItem(`${pendingKey}:${sessionToken}`);
         if (raw) {
           const pending = JSON.parse(raw) as Record<string, number>;
           if (pending && typeof pending === "object") {

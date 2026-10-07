@@ -6,6 +6,7 @@ import {
   ensureVariantTables,
   fetchVariantMap,
   normalizeVersion,
+  normalizeSet,
   resolveMarks,
   resolveQuestions,
   shuffledOrder,
@@ -144,6 +145,13 @@ type ResultDetail = {
   marks: number;
   /** Marks obtained for this question — negative when a wrong answer costs marks. */
   obtained: number;
+  question?: string;
+  options?: string[];
+  explanation?: string | null;
+  questionImage?: string | null;
+  gradingSource?: "base" | "variant";
+  questionVersion?: QuestionVersion;
+  assignedSet?: QuestionSet;
 };
 
 /** Best score achieved by any student on this exam (null when no results). */
@@ -221,6 +229,13 @@ type GradingQuestionRow = {
   /** NULL = unknown answer (never defaulted to 0/A; cannot award marks). */
   correct_index: number | null;
   marks: string | number;
+  question?: string;
+  options?: string[];
+  explanation?: string | null;
+  questionImage?: string | null;
+  gradingSource?: "base" | "variant";
+  questionVersion?: QuestionVersion;
+  assignedSet?: QuestionSet;
 };
 
 type AttemptRow = {
@@ -335,7 +350,8 @@ async function readAttemptLock(
     const attempt = rows[0];
     if (!attempt || attempt.status !== "active") return null;
     const version = normalizeVersion(attempt.question_version) ?? "bangla";
-    const set: QuestionSet = attempt.assigned_set === "B" ? "B" : "A";
+    const set = normalizeSet(attempt.assigned_set);
+    if (!normalizeVersion(attempt.question_version) || !set) return null;
     const order = parseLockedOrder(attempt.question_order);
     if (!order) return null;
     return { version, set, order };
@@ -358,16 +374,23 @@ async function backfillAttemptLock(
     await ensureVariantTables();
     // Availability-aware: a single fully-authored Set is reused as-is so a
     // resumed legacy attempt can never land on an unavailable Set.
-    const assignedSet = await assignSetForExam(examId, questionVersion);
+    const existing = await query<AttemptRow[]>(
+      `SELECT session_token, status, question_version, assigned_set, question_order FROM exam_attempts WHERE exam_id = ? AND student_uid = ? LIMIT 1`,
+      [examId, uid],
+    );
+    const attempt = existing[0];
+    if (!attempt || attempt.status !== "active") return;
+    const version = normalizeVersion(attempt.question_version) ?? questionVersion;
+    const assignedSet = normalizeSet(attempt.assigned_set) ?? await assignSetForExam(examId, version);
     const idRows = await query<{ id: number }[]>(
       `SELECT id FROM exam_questions WHERE exam_id = ? AND is_active = 1 ORDER BY sort_order ASC, id ASC`,
       [examId],
     );
-    const order = shuffledOrder(idRows.map((r) => Number(r.id)));
+    const order = parseLockedOrder(attempt.question_order) ?? shuffledOrder(idRows.map((r) => Number(r.id)));
     await exec(
-      `UPDATE exam_attempts SET question_version = ?, assigned_set = ?, question_order = ?, last_seen = CURRENT_TIMESTAMP
-        WHERE exam_id = ? AND student_uid = ? AND status = 'active'`,
-      [questionVersion, assignedSet, JSON.stringify(order), examId, uid],
+      `UPDATE exam_attempts SET question_version = COALESCE(question_version, ?), assigned_set = COALESCE(assigned_set, ?), question_order = COALESCE(question_order, ?), last_seen = CURRENT_TIMESTAMP
+        WHERE exam_id = ? AND student_uid = ? AND status = 'active' AND session_token = ?`,
+      [version, assignedSet, JSON.stringify(order), examId, uid, attempt.session_token],
     );
   } catch {
     // Best effort — grading falls back to base rows when no lock exists.
@@ -605,7 +628,7 @@ async function startExamAttempt(
       const needBackfill =
         !existing[0].expires_at || !existing[0].started_at;
       const lock = parseLockedOrder(existing[0].question_order);
-      if (!lock || !normalizeVersion(existing[0].question_version)) {
+      if (!lock || !normalizeVersion(existing[0].question_version) || !normalizeSet(existing[0].assigned_set)) {
         await backfillAttemptLock(examId, uid, questionVersion);
       } else if (needBackfill) {
         await backfillExpiresAt(examId, uid);
@@ -757,13 +780,8 @@ export async function saveExamAnswer(
   // model). Only a truly different live session is impossible now — but keep
   // the guard: unknown token → show stored result, never overwrite.
   if (attempt.session_token !== token) {
-    // Allow shared-attempt writes: if the caller holds a stale token but the
-    // attempt is still the same logical session (started_at unchanged), treat
-    // it as the same attempt. Otherwise terminate to result view.
-    // Simplest safe rule: if attempt is active and not expired, accept the
-    // answer regardless of token (multi-tab resume), and do NOT terminate.
-    // Token mismatch no longer kills a session — expiry does.
-    void studentName;
+    // Resumed tabs share the same token; a different token may be an old retake.
+    return { accepted: false, terminated: true };
   }
   // Server-side expiry check — expires_at is authoritative (no grace games
   // beyond a 60s network-tolerance window so in-flight submits at 29:59 land).
@@ -793,17 +811,37 @@ export async function saveExamAnswer(
   } catch {
     // On error, fall through to normal handling
   }
-  try {
-    await exec(
-      `INSERT INTO exam_attempt_answers (exam_id, student_uid, question_id, option_index)
-       VALUES (?, ?, ?, ?)`,
-      [examId, uid, questionId, optionIndex],
+  const variants = await fetchVariantMap(examId, true);
+  return withTransaction(async (connection) => {
+    const [attemptRows] = await connection.query<RowDataPacket[]>(
+      `SELECT * FROM exam_attempts WHERE exam_id = ? AND student_uid = ? LIMIT 1 FOR UPDATE`,
+      [examId, uid],
     );
-    return { accepted: true };
-  } catch {
-    // Duplicate answer — locked after the first selection.
-    return { accepted: false };
-  }
+    const current = (attemptRows as unknown as AttemptRow[])[0];
+    if (!current || current.status !== "active" || current.session_token !== token) {
+      return { accepted: false, terminated: true };
+    }
+    const order = parseLockedOrder(current.question_order);
+    const version = normalizeVersion(current.question_version);
+    const set = normalizeSet(current.assigned_set);
+    if (!order?.includes(questionId) || !version || !set) return { accepted: false };
+    const [questionRows] = await connection.query<RowDataPacket[]>(
+      `SELECT id, question, options, marks, correct_index, explanation, question_image FROM exam_questions WHERE exam_id = ? AND id = ? AND is_active = 1`,
+      [examId, questionId],
+    );
+    const question = resolveQuestions(questionRows as unknown as Parameters<typeof resolveQuestions>[0], variants, version, set)[0];
+    if (!question || !Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= question.options.length) return { accepted: false };
+    try {
+      await connection.query(
+        `INSERT INTO exam_attempt_answers (exam_id, student_uid, question_id, option_index) VALUES (?, ?, ?, ?)`,
+        [examId, uid, questionId, optionIndex],
+      );
+      return { accepted: true };
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ER_DUP_ENTRY") throw error;
+      return { accepted: false };
+    }
+  });
 }
 
 async function fetchStoredAnswers(
@@ -847,7 +885,16 @@ function gradeAnswers(
     // Correct answer is normalized the same way (never confused with the
     // user's answer; malformed stays null and can never match).
     const correctIdx = normalizeStoredAnswerIndex(row.correct_index);
-    const marks = Number(row.marks) || 1;
+    const marks = resolveMarks(row.marks, 1);
+    const snapshot = row.options ? {
+      question: row.question ?? "",
+      options: row.options,
+      explanation: row.explanation ?? null,
+      questionImage: row.questionImage ?? null,
+      gradingSource: row.gradingSource,
+      questionVersion: row.questionVersion,
+      assignedSet: row.assignedSet,
+    } : {};
     if (chosen === null) {
       skippedCount += 1;
       details.push({
@@ -856,6 +903,7 @@ function gradeAnswers(
         correctIndex: correctIdx,
         marks,
         obtained: 0,
+        ...snapshot,
       });
       continue;
     }
@@ -869,6 +917,7 @@ function gradeAnswers(
         correctIndex: correctIdx,
         marks,
         obtained: marks,
+        ...snapshot,
       });
     } else {
       score -= negativePerWrong;
@@ -879,6 +928,7 @@ function gradeAnswers(
         correctIndex: correctIdx,
         marks,
         obtained: -negativePerWrong,
+        ...snapshot,
       });
     }
   }
@@ -916,6 +966,7 @@ async function finalizeAttempt(
   studentName: string,
   extraAnswers: Record<string, number>,
   auto = false,
+  expectedToken: string | null = null,
 ): Promise<SubmissionOutcome | null> {
   const exams = await fetchExams();
   const found = exams.find((exam) => exam.id === examId);
@@ -947,7 +998,32 @@ async function finalizeAttempt(
     }
   }
 
-  const stored = await fetchStoredAnswers(examId, uid);
+  await ensureVariantTables();
+  const variants = await fetchVariantMap(examId, true);
+  try { await ensureColumn("exam_results", "attempt_type", "`attempt_type` ENUM('scheduled','practice') NOT NULL DEFAULT 'scheduled'"); } catch {}
+  const outcome = await withTransaction(async (connection) => {
+  // Serialize answer saves and submitters on the same attempt; a failed insert
+  // rolls back its status and keeps the student's answers available for retry.
+  const query = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
+    const [rows] = await connection.query(sql, params);
+    return rows as T;
+  };
+  const exec = async (sql: string, params: unknown[] = []) => {
+    const [result] = await connection.query(sql, params);
+    return result as unknown as { affectedRows: number };
+  };
+  const attempts = await query<AttemptRow[]>(
+    `SELECT * FROM exam_attempts WHERE exam_id = ? AND student_uid = ? LIMIT 1 FOR UPDATE`,
+    [examId, uid],
+  );
+  const attempt = attempts[0];
+  if (!attempt || (expectedToken && attempt.session_token !== expectedToken)) return null;
+  if (attempt.status !== "active") return latestOutcome(examId, uid);
+  const storedRows = await query<{ question_id: number; option_index: number }[]>(
+    `SELECT question_id, option_index FROM exam_attempt_answers WHERE exam_id = ? AND student_uid = ?`,
+    [examId, uid],
+  );
+  const stored = Object.fromEntries(storedRows.map((r) => [String(r.question_id), r.option_index]));
   const merged: Record<string, number> = { ...extraAnswers };
   for (const [key, value] of Object.entries(stored)) {
     merged[key] = value;
@@ -955,41 +1031,32 @@ async function finalizeAttempt(
 
   // Grade against the student's locked Version/Set mapping (permanent
   // Question IDs). Falls back to base rows for legacy attempts without a lock.
-  const lock = await readAttemptLock(examId, uid);
-  let rows: GradingQuestionRow[];
-  try {
-    const baseRows = await query<
-      { id: number; correct_index: number | null; marks: string | number }[]
-    >(
-      `SELECT id, correct_index, marks FROM exam_questions
-       WHERE exam_id = ? AND is_active = 1`,
-      [examId],
-    );
-    if (lock) {
-      const variants = await fetchVariantMap(examId);
-      const resolved = resolveQuestions(
-        baseRows.map((r) => ({
-          id: r.id,
-          question: "",
-          options: "[]",
-          marks: r.marks,
-          correct_index: r.correct_index,
-          explanation: null,
-        })),
-        variants,
-        lock.version,
-        lock.set,
-      );
-      rows = resolved.map((q) => ({ id: q.id, correct_index: q.correctIndex, marks: q.marks }));
-    } else {
-      rows = baseRows;
-    }
-  } catch {
-    rows = await query<GradingQuestionRow[]>(
-      `SELECT id, correct_index, marks FROM exam_questions
-       WHERE exam_id = ? AND is_active = 1`,
-      [examId],
-    );
+  const version = normalizeVersion(attempt.question_version);
+  const set = normalizeSet(attempt.assigned_set);
+  const order = parseLockedOrder(attempt.question_order);
+  if (!version || !set || !order) throw new Error("Attempt paper assignment is missing. Resume the exam before submitting.");
+  const lock = { version, set, order };
+  const baseRows = await query<{
+    id: number; question: string; options: string; correct_index: number | null;
+    marks: string | number; explanation: string | null; question_image?: string | null;
+  }[]>(
+    `SELECT id, question, options, correct_index, marks, explanation, question_image FROM exam_questions
+     WHERE exam_id = ? AND is_active = 1`,
+    [examId],
+  );
+  const resolved = resolveQuestions(baseRows, variants, lock.version, lock.set);
+  const byId = new Map(resolved.map((q) => [q.id, q]));
+  const rows: GradingQuestionRow[] = [];
+  for (const id of new Set(lock.order)) {
+    const q = byId.get(id);
+    if (!q || q.options.length < 2) throw new Error("The assigned exam paper is unavailable. Please retry or contact support.");
+    rows.push({ ...q, correct_index: q.correctIndex, gradingSource: q.fromVariant ? "variant" : "base", questionVersion: lock.version, assignedSet: lock.set });
+  }
+  // Persist only this paper's permanent IDs and valid option indexes.
+  for (const key of Object.keys(merged)) delete merged[key];
+  for (const q of rows) {
+    const chosen = normalizeStoredAnswerIndex(stored[String(q.id)] ?? extraAnswers[String(q.id)]);
+    if (chosen !== null && chosen < q.options!.length) merged[String(q.id)] = chosen;
   }
 
   const negativePerWrong = negativePerWrongFor(found);
@@ -1083,47 +1150,11 @@ async function finalizeAttempt(
   // exam_results insert below runs solely for the winner, so concurrent
   // submit/expiry calls can never double-insert.
   const finalStatus = auto ? "auto_submitted" : "submitted";
-  let priorMaxId = 0;
-  try {
-    const maxRows = await query<{ maxId: number | null }[]>(
-      `SELECT MAX(id) AS maxId FROM exam_results WHERE exam_id = ? AND student_uid = ?`,
-      [examId, uid],
-    );
-    priorMaxId = Number(maxRows[0]?.maxId) || 0;
-  } catch {
-    // Best-effort — loser falls back to a single latestOutcome read.
-  }
-  try {
-    const res = (await exec(
-      `UPDATE exam_attempts SET status = ?, submitted_at = CURRENT_TIMESTAMP WHERE exam_id = ? AND student_uid = ? AND status = 'active'`,
-      [finalStatus, examId, uid],
-    )) as unknown as { affectedRows?: number };
-    if (res && typeof res.affectedRows === "number" && res.affectedRows === 0) {
-      // Lost the race: wait briefly for the winner's insert, then return the
-      // stored result instead of inserting a duplicate.
-      for (let i = 0; i < 20; i++) {
-        try {
-          const latest = await query<{ maxId: number | null }[]>(
-            `SELECT MAX(id) AS maxId FROM exam_results WHERE exam_id = ? AND student_uid = ?`,
-            [examId, uid],
-          );
-          if ((Number(latest[0]?.maxId) || 0) > priorMaxId) break;
-        } catch {}
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      const existing = await latestOutcome(examId, uid);
-      if (existing) return auto ? { ...existing, autoSubmitted: true } : existing;
-      return null;
-    }
-  } catch {
-    // Legacy DB without new enum values / submitted_at → fallback.
-    try {
-      await exec(
-        `UPDATE exam_attempts SET status = 'submitted' WHERE exam_id = ? AND student_uid = ? AND status = 'active'`,
-        [examId, uid],
-      );
-    } catch {}
-  }
+  const claimed = await exec(
+    `UPDATE exam_attempts SET status = ?, submitted_at = CURRENT_TIMESTAMP WHERE exam_id = ? AND student_uid = ? AND status = 'active' AND session_token = ?`,
+    [finalStatus, examId, uid, attempt.session_token],
+  );
+  if (claimed.affectedRows !== 1) return null;
   // Insert with attempt_type when column exists; fallback without it for legacy DBs.
   // The locked Version/Set/Order snapshot travels with the result so the
   // answer script replays the student's own language version and order.
@@ -1131,16 +1162,6 @@ async function finalizeAttempt(
   const lockSet = lock?.set ?? null;
   const lockOrderJson = lock ? JSON.stringify(lock.order) : null;
   try {
-    try {
-      await ensureColumn(
-        "exam_results",
-        "attempt_type",
-        "`attempt_type` ENUM('scheduled','practice') NOT NULL DEFAULT 'scheduled'",
-      );
-    } catch {}
-    try {
-      await ensureVariantTables();
-    } catch {}
     await exec(
       `INSERT INTO exam_results
          (exam_id, student_uid, student_name, score, total_marks, answers,
@@ -1165,7 +1186,8 @@ async function finalizeAttempt(
         lockOrderJson,
       ],
     );
-  } catch {
+  } catch (error) {
+    if (!isResultSchemaCompatibilityError(error)) throw error;
     // Some deployed schemas use ENUM('live','practice'), not 'scheduled'.
     // Let their default official attempt type apply, but KEEP the paper snapshot.
     try {
@@ -1182,7 +1204,8 @@ async function finalizeAttempt(
           isSecondTimer ? 1 : 0, lockVersion, lockSet, lockOrderJson,
         ],
       );
-    } catch {
+    } catch (error) {
+      if (!isResultSchemaCompatibilityError(error)) throw error;
       // Legacy DBs without snapshot columns retain the existing fallback.
       try {
         await exec(
@@ -1198,8 +1221,9 @@ async function finalizeAttempt(
             isSecondTimer ? 1 : 0, attemptType,
           ],
         );
-      } catch {
-        // Column missing or insertion failed — retry without attempt_type (legacy).
+      } catch (error) {
+        if (!isResultSchemaCompatibilityError(error)) throw error;
+        // Retry only a missing column / legacy enum, never a persistence failure.
         await exec(
           `INSERT INTO exam_results
              (exam_id, student_uid, student_name, score, total_marks, answers,
@@ -1216,36 +1240,31 @@ async function finalizeAttempt(
       }
     }
   }
-  await updateMeritPositions(examId);
   await exec(
     `DELETE FROM exam_attempt_answers WHERE exam_id = ? AND student_uid = ?`,
     [examId, uid],
   );
-
-  let meritPosition: number | null = null;
-  try {
-    const positionRows = await query<{ merit_position: number | null }[]>(
-      `SELECT merit_position FROM exam_results
-       WHERE exam_id = ? AND student_uid = ?
-       ORDER BY id DESC LIMIT 1`,
-      [examId, uid],
-    );
-    meritPosition = positionRows[0]?.merit_position ?? null;
-  } catch {
-    // Leave null on failure.
-  }
 
   return {
     ...graded,
     score: finalScore,
     timerPenalty,
     secondTimer: isSecondTimer,
-    meritPosition,
+    meritPosition: null,
     timeTakenSeconds,
     examName: found.title,
     questionVersion: lockVersion,
-    highestMark: await highestMarkFor(examId),
   };
+  });
+  if (!outcome) return null;
+  await updateMeritPositions(examId);
+  const latest = await latestOutcome(examId, uid);
+  return latest ?? outcome;
+}
+
+function isResultSchemaCompatibilityError(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  return code === "ER_BAD_FIELD_ERROR" || code === "WARN_DATA_TRUNCATED" || code === "ER_TRUNCATED_WRONG_VALUE_FOR_FIELD";
 }
 
 /** Rebuild the outcome of the most recent stored result for this student. */
@@ -1262,10 +1281,13 @@ async function latestOutcome(
       negative_deduction: string | number | null;
       timer_penalty: string | number | null;
       is_second_timer: number | null;
+      answers: string | null;
+      details?: string | null;
+      question_version?: string | null;
+      assigned_set?: string | null;
     }[]
   >(
-    `SELECT score, total_marks, merit_position, time_taken_seconds,
-            negative_deduction, timer_penalty, is_second_timer
+    `SELECT *
      FROM exam_results
      WHERE exam_id = ? AND student_uid = ? ORDER BY id DESC LIMIT 1`,
     [examId, uid],
@@ -1274,30 +1296,15 @@ async function latestOutcome(
   if (!row) return null;
   const exams = await fetchExams();
   const found = exams.find((exam) => exam.id === examId);
-  const questions = await query<GradingQuestionRow[]>(
+  const storedDetails = parseJsonColumn<ResultDetail[]>(row.details);
+  const questions = Array.isArray(storedDetails) && storedDetails.length > 0 ? [] : await query<GradingQuestionRow[]>(
     `SELECT id, correct_index, marks FROM exam_questions WHERE exam_id = ? AND is_active = 1`,
     [examId],
   );
   // Counts come from the last stored answers snapshot when available.
   // Correctness is evaluated against the locked Version/Set mapping stored
   // with the result (permanent Question IDs) — never the display serial.
-  const resultRows = await query<{
-    answers: string | null;
-    question_version?: string | null;
-    assigned_set?: string | null;
-  }[]>(
-    `SELECT answers, question_version, assigned_set FROM exam_results WHERE exam_id = ? AND student_uid = ?
-     ORDER BY id DESC LIMIT 1`,
-    [examId, uid],
-  ).catch(async () => {
-    // Legacy DBs without the snapshot columns.
-    const legacy = await query<{ answers: string | null }[]>(
-      `SELECT answers FROM exam_results WHERE exam_id = ? AND student_uid = ?
-       ORDER BY id DESC LIMIT 1`,
-      [examId, uid],
-    );
-    return legacy as { answers: string | null; question_version?: string | null; assigned_set?: string | null }[];
-  });
+  const resultRows = [row];
   // Counts come from the last stored answers snapshot when available.
   // Correctness is evaluated against the locked Version/Set mapping stored
   // with the result (permanent Question IDs) — never the display serial.
@@ -1311,7 +1318,7 @@ async function latestOutcome(
     const snapVersion = normalizeVersion(resultRows[0]?.question_version);
     const snapSetRaw = String(resultRows[0]?.assigned_set ?? "").toUpperCase();
     const snapSet: QuestionSet | null = snapSetRaw === "B" ? "B" : snapSetRaw === "A" ? "A" : null;
-    if (snapVersion && snapSet) {
+    if (snapVersion && snapSet && questions.length > 0) {
       const variants = await fetchVariantMap(examId);
       for (const q of questions) {
         const v = variants.get(`${Number(q.id)}:${snapVersion}:${snapSet}`);
@@ -1334,7 +1341,17 @@ async function latestOutcome(
   let wrongCount = 0;
   let skippedCount = 0;
   let rawMarks = 0;
-  for (const question of questions) {
+  if (Array.isArray(storedDetails) && storedDetails.length > 0) {
+    for (const detail of storedDetails) {
+      const chosen = normalizeStoredAnswerIndex(detail.chosenIndex);
+      const correct = normalizeStoredAnswerIndex(detail.correctIndex);
+      if (chosen === null) skippedCount += 1;
+      else if (correct !== null && chosen === correct) {
+        correctCount += 1;
+        rawMarks += resolveMarks(detail.marks, 1);
+      } else wrongCount += 1;
+    }
+  } else for (const question of questions) {
     // String-keyed per-question lookup ("123" and 123 resolve identically);
     // numeric strings / letters normalize, malformed stays unknown (null).
     const chosen = normalizeStoredAnswerIndex(answers[String(question.id)]);
@@ -1373,7 +1390,7 @@ async function latestOutcome(
     timerPenalty,
     secondTimer: (row.is_second_timer ?? 0) === 1,
     examName: found?.title ?? undefined,
-    questionVersion: normalizeVersion(resultRows[0]?.question_version),
+    questionVersion: normalizeVersion(row.question_version) ?? (Array.isArray(storedDetails) ? normalizeVersion(storedDetails[0]?.questionVersion) : null),
     meritPosition: row.merit_position ?? null,
     timeTakenSeconds: row.time_taken_seconds ?? null,
     highestMark: await highestMarkFor(examId),
@@ -1477,7 +1494,7 @@ export async function getExamForTaking(
       questionImage: q.questionImage ?? null,
     }));
 
-  /** Apply a locked shuffled order of permanent IDs; unknown/new IDs appended in admin order. */
+  /** A locked attempt never acquires questions added after its start. */
   const applyLockedOrder = (
     resolved: ResolvedQuestion[],
     order: number[] | null,
@@ -1492,9 +1509,6 @@ export async function getExamForTaking(
         out.push(q);
         seen.add(q.id);
       }
-    }
-    for (const q of resolved) {
-      if (!seen.has(q.id)) out.push(q);
     }
     return out;
   };
@@ -1832,6 +1846,7 @@ export async function submitExamAttempt(
   uid: string,
   studentName: string,
   answers: Record<string, number>,
+  expectedToken: string | null = null,
 ): Promise<SubmissionOutcome | null> {
   const exams = await fetchExams();
   const found = exams.find((exam) => exam.id === examId);
@@ -1879,7 +1894,8 @@ export async function submitExamAttempt(
     `SELECT session_token, status, started_at, expires_at, last_seen FROM exam_attempts WHERE exam_id = ? AND student_uid = ? LIMIT 1`,
     [examId, uid],
   );
-  if (attempts[0] && attempts[0].status !== "active") {
+  if (!attempts[0] || (expectedToken && attempts[0].session_token !== expectedToken)) return null;
+  if (attempts[0].status !== "active") {
     const existing = await latestOutcome(examId, uid);
     if (existing) {
       const wasAuto = attempts[0].status === "auto_submitted" || attempts[0].status === "expired";
@@ -1893,7 +1909,7 @@ export async function submitExamAttempt(
   if (attempts[0]?.status === "active") {
     try {
       if (isAttemptExpired(attempts[0], found.durationMinutes)) {
-        const outcome = await finalizeAttempt(examId, uid, studentName, answers, true);
+        const outcome = await finalizeAttempt(examId, uid, studentName, answers, true, expectedToken);
         if (outcome) return { ...outcome, autoSubmitted: true };
         const latest = await latestOutcome(examId, uid);
         if (latest) return { ...latest, autoSubmitted: true };
@@ -1903,7 +1919,7 @@ export async function submitExamAttempt(
     }
   }
 
-  return finalizeAttempt(examId, uid, studentName, answers, false);
+  return finalizeAttempt(examId, uid, studentName, answers, false, expectedToken);
 }
 
 export type AnswerScriptQuestion = {
@@ -1948,6 +1964,7 @@ export async function getExamResultScript(
   examId: string,
   uid: string,
   requestedVersion: QuestionVersion | null = null,
+  resultId?: number,
 ): Promise<ExamResultScript | null> {
   const resultRows = await query<
     {
@@ -1970,9 +1987,9 @@ export async function getExamResultScript(
     // Read optional snapshot fields when present without requiring every legacy
     // DB to have all three columns. Only mapped script fields leave the server.
     `SELECT * FROM exam_results
-     WHERE exam_id = ? AND student_uid = ?
+     WHERE exam_id = ? AND student_uid = ?${resultId === undefined ? "" : " AND id = ?"}
      ORDER BY id DESC LIMIT 1`,
-    [examId, uid],
+    resultId === undefined ? [examId, uid] : [examId, uid, resultId],
   );
   const result = resultRows[0];
   if (!result) return null;
@@ -1985,8 +2002,8 @@ export async function getExamResultScript(
 
   // A URL cannot switch a persisted attempt's medium. The validated request
   // version is only a fallback for legacy results without a language snapshot.
-  const snapVersion = normalizeVersion(result.question_version) ?? requestedVersion ?? "bangla";
-  const snapSetRaw = String(result.assigned_set ?? "").toUpperCase();
+  const snapVersion = normalizeVersion(result.question_version) ?? normalizeVersion(details[0]?.questionVersion) ?? requestedVersion ?? "bangla";
+  const snapSetRaw = String(result.assigned_set ?? details[0]?.assignedSet ?? "").toUpperCase();
   const snapSet: QuestionSet | null =
     snapSetRaw === "B" ? "B" : snapSetRaw === "A" ? "A" : null;
   let snapOrder: number[] | null = null;
@@ -2006,7 +2023,8 @@ export async function getExamResultScript(
     snapOrder = null;
   }
 
-  const questionRows = await query<{
+  const hasPaperSnapshot = details.length > 0 && details.every((detail) => typeof detail.question === "string" && Array.isArray(detail.options));
+  const questionRows = hasPaperSnapshot ? [] : await query<{
     id: number;
     question: string;
     options: string;
@@ -2016,7 +2034,7 @@ export async function getExamResultScript(
     question_image?: string | null;
   }[]>(
     `SELECT id, question, options, marks, correct_index, explanation, question_image FROM exam_questions
-      WHERE exam_id = ? AND is_active = 1 ORDER BY id ASC`,
+      WHERE exam_id = ? ORDER BY id ASC`,
     [examId],
   );
   // The student's language version/set replay: variant content wins when the
@@ -2027,7 +2045,7 @@ export async function getExamResultScript(
   // question number with blank text and empty/dark option blocks.
   let variantOverlay = new Map<string, VariantRow>();
   try {
-    variantOverlay = await fetchVariantMap(examId);
+    if (!hasPaperSnapshot) variantOverlay = await fetchVariantMap(examId);
   } catch {
     variantOverlay = new Map();
   }
@@ -2049,8 +2067,14 @@ export async function getExamResultScript(
   const questions: AnswerScriptQuestion[] = [];
   const seen = new Set<number>();
   for (const detail of details) {
-    const meta = byId.get(detail.questionId);
-    if (!meta) continue;
+    const meta = typeof detail.question === "string" && Array.isArray(detail.options)
+      ? { question: detail.question, options: detail.options, marks: detail.marks,
+          explanation: detail.explanation ?? null, questionImage: detail.questionImage ?? null,
+          contentFallback: null }
+      : byId.get(detail.questionId) ?? {
+          question: "Original question content is unavailable.", options: [], marks: detail.marks,
+          explanation: null, questionImage: null, contentFallback: "unavailable" as const,
+        };
     seen.add(detail.questionId);
     // Each question resolves its OWN stored answer (current question's ID —
     // never answers[0] or a shared global). Legacy rows may carry numeric
@@ -2069,7 +2093,7 @@ export async function getExamResultScript(
     });
   }
   for (const [key, meta] of byId.entries()) {
-    if (seen.has(key)) continue;
+    if (seen.has(key) || details.length > 0 || (snapOrder && !snapOrder.includes(key))) continue;
     const raw = fallbackAnswers[String(key)];
     const chosen = normalizeStoredAnswerIndex(raw);
     // Prefer the correctIndex stored at grading time (detail); only fall back
@@ -2108,7 +2132,7 @@ export async function getExamResultScript(
       if (rb !== undefined) return 1;
       return a.questionId - b.questionId;
     });
-  } else {
+  } else if (!hasPaperSnapshot) {
     questions.sort((a, b) => a.questionId - b.questionId);
   }
 

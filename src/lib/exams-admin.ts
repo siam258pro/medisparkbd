@@ -1,4 +1,6 @@
 import { exec, parseJsonColumn, query, ensureColumn, withTransaction } from "@/lib/mysql";
+import type { PoolConnection } from "mysql2/promise";
+import { randomUUID } from "node:crypto";
 import { buildDefaultExamRules } from "@/lib/exam-rules";
 import { strictAnswerIndex } from "@/lib/paste-mcq-parser";
 import { revalidatePath, revalidateTag, unstable_cache } from "next/cache";
@@ -389,60 +391,17 @@ export function ruleTemplateDefaults(template: string): {
  * Missing slots are created with empty question text for incomplete slots.
  */
 export async function ensureQuestionSlots(examId: string, count: number): Promise<void> {
-  if (!examId || !count || count <= 0) return;
+  if (!Number.isInteger(count) || count < 0 || count > MAX_EXAM_QUESTIONS) throw new Error("Invalid question slot count.");
+  if (count === 0) return;
   await ensureTables();
-  try {
-    const existing = await query<{ sort_order: number }[]>(
-      `SELECT sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC`,
-      [examId],
-    );
-    const existingOrders = new Set(existing.map((r) => Number(r.sort_order)));
-    const missing: number[] = [];
-    for (let i = 1; i <= count; i += 1) {
-      if (!existingOrders.has(i)) missing.push(i);
-    }
-    if (missing.length === 0) return;
-    // Use exam's marks_per_question for slot marks when available
-    let marksPerSlot = 1;
-    try {
-      const examRows = await query<{ marks_per_question: string | number | null }[]>(
-        `SELECT marks_per_question FROM exams WHERE id = ? LIMIT 1`,
-        [examId],
-      );
-      const raw = Number(examRows[0]?.marks_per_question ?? 1);
-      if (Number.isFinite(raw) && raw > 0) marksPerSlot = raw;
-    } catch {
-      marksPerSlot = 1;
-    }
-    if (missing.length > 0) {
-      const placeholders = missing.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
-      const values: unknown[] = [];
-      for (const sortOrder of missing) {
-        // Placeholder slots use correct_index 0: production schema is
-        // NOT NULL DEFAULT 0, and NULL inserts fail silently here.
-        // The answer is set properly when the admin fills the slot.
-        values.push(
-          examId,
-          "",
-          "",
-          null,
-          JSON.stringify(["", "", "", ""]),
-          0,
-          null,
-          marksPerSlot,
-          sortOrder,
-          1,
-        );
-      }
-      await exec(
-        `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
-         VALUES ${placeholders}`,
-        values,
-      );
-    }
-  } catch {
-    // Best-effort — slots may be created on next call.
-  }
+  await withTransaction(async (conn) => {
+    await lockExam(conn, examId);
+    const [rows] = await conn.query(`SELECT marks_per_question FROM exams WHERE id = ?`, [examId]);
+    const marks = Number((rows as { marks_per_question: number | string }[])[0]?.marks_per_question ?? 1);
+    await createMissingQuestionSlots(conn, examId, count, marks);
+    await recomputeExamTotals(conn, examId);
+  });
+  invalidateExamsCache();
 }
 
 async function ensureTables(): Promise<void> {
@@ -572,12 +531,7 @@ async function ensureTables(): Promise<void> {
   } catch {
     // Best effort — column may already exist.
   }
-  // Question ordering column for admin reorder.
-  try {
-    await ensureColumn("exam_questions", "sort_order", "`sort_order` INT NOT NULL DEFAULT 0 AFTER marks");
-  } catch {
-    // Best effort.
-  }
+
   // ── Exam Mode: Live vs Practice (separate from Published/Draft and Running/Upcoming) ──
   try {
     await ensureColumn("exams", "exam_mode", "`exam_mode` ENUM('live','practice') NOT NULL DEFAULT 'live' AFTER kind");
@@ -595,11 +549,7 @@ async function ensureTables(): Promise<void> {
   } catch {
     // Best effort — column may already exist.
   }
-  try {
-    await ensureColumn("exam_questions", "question_image", "`question_image` VARCHAR(1024) NULL AFTER question");
-  } catch {
-    // Best effort — column may already exist.
-  }
+
   // ── Flow 5 exam categories (additive; legacy rows keep NULL = old Exam flow) ──
   try {
     await ensureColumn(
@@ -626,13 +576,17 @@ async function ensureTables(): Promise<void> {
     exam_id VARCHAR(64) NULL,
     bank_subject VARCHAR(191) NOT NULL DEFAULT '',
     question TEXT NOT NULL,
+    question_image VARCHAR(1024) NULL,
     options JSON NOT NULL,
     correct_index INT NULL DEFAULT NULL,
     explanation TEXT NULL,
     marks DECIMAL(5,2) NOT NULL DEFAULT 1,
+    sort_order INT NOT NULL DEFAULT 0,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+  await ensureColumn("exam_questions", "sort_order", "`sort_order` INT NOT NULL DEFAULT 0 AFTER marks");
+  await ensureColumn("exam_questions", "question_image", "`question_image` VARCHAR(1024) NULL AFTER question");
   // ── Normalized question options ──
   await exec(`CREATE TABLE IF NOT EXISTS exam_question_options (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -699,6 +653,54 @@ const EXAM_COLUMNS = `id, title, description, banner_url, kind, exam_mode, batch
   total_marks, marks_per_question, negative_marks, negative_enabled, negative_per_wrong,
   second_timer_enabled, second_timer_deduction, question_count, status,
   featured, scheduled_at, ends_at, answer_key, category_id, rule_template`;
+
+const MAX_EXAM_QUESTIONS = 500;
+
+function isMissingTable(error: unknown): boolean {
+  return (error as { code?: string })?.code === "ER_NO_SUCH_TABLE";
+}
+
+/** Optional legacy tables may be absent; every other DB failure must roll back. */
+async function optionalTableQuery(conn: PoolConnection, sql: string, params: unknown[] = []): Promise<unknown | null> {
+  try {
+    const [rows] = await conn.query(sql, params);
+    return rows;
+  } catch (error) {
+    if (isMissingTable(error)) return null;
+    throw error;
+  }
+}
+
+async function createMissingQuestionSlots(conn: PoolConnection, examId: string, count: number, marks: number): Promise<void> {
+  const [rows] = await conn.query(`SELECT sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC FOR UPDATE`, [examId]);
+  const orders = (rows as { sort_order: number }[]).map((row) => Number(row.sort_order));
+  if (new Set(orders).size !== orders.length) throw new Error("Duplicate question slot orders must be repaired before saving this exam.");
+  const existing = new Set(orders);
+  const missing = Array.from({ length: count }, (_, index) => index + 1).filter((order) => !existing.has(order));
+  if (missing.length === 0) return;
+  const values = missing.flatMap((order) => [examId, "", "", null, JSON.stringify(["", "", "", ""]), 0, null, marks, order, 1]);
+  await conn.query(
+    `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active) VALUES ${missing.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ")}`,
+    values,
+  );
+}
+
+async function lockExam(conn: PoolConnection, examId: string): Promise<void> {
+  const [rows] = await conn.query(`SELECT id FROM exams WHERE id = ? FOR UPDATE`, [examId]);
+  if ((rows as unknown[]).length === 0) throw new Error("Exam not found.");
+}
+
+async function recomputeExamTotals(conn: PoolConnection, examId: string | null): Promise<void> {
+  if (!examId) return;
+  const [rows] = await conn.query(
+    `SELECT COUNT(*) AS count, SUM(marks) AS marks FROM exam_questions WHERE exam_id = ? AND is_active = 1`,
+    [examId],
+  );
+  const totals = (rows as { count: number; marks: string | number | null }[])[0];
+  await conn.query(`UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`, [
+    Number(totals?.count ?? 0), Number(totals?.marks ?? 0), examId,
+  ]);
+}
 
 // ── Exams CRUD ───────────────────────────────────────────────────────────
 
@@ -899,7 +901,30 @@ export async function saveExam(
   adminUid: string,
 ): Promise<Exam> {
   await ensureTables();
+  let previousStatus: string | null = null;
+  const exam = await withTransaction(async (conn) => {
+  const query = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
+    const [rows] = await conn.query(sql, params);
+    return rows as T;
+  };
   const id = asString(input.id);
+  const stored = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? FOR UPDATE`, [id]);
+  if (stored[0]) {
+    const assignments = await query<{ course_id: string }[]>(`SELECT course_id FROM exam_courses WHERE exam_id = ?`, [id]);
+    // Config forms send partial payloads: omitted keys must not erase grading,
+    // answer keys, scheduling, or course linkage on an unrelated edit.
+    const defaults = rowToExam(stored[0]);
+    const supplied = input;
+    input = { ...defaults, courseIds: assignments.map((row) => row.course_id), ...supplied };
+    // Stored aliases must not override an explicitly supplied legacy field.
+    if (!Object.hasOwn(supplied, "scope")) delete input.scope;
+    if (Object.hasOwn(supplied, "question_count") || Object.hasOwn(supplied, "totalQuestions")) delete input.questionCount;
+    if (Object.hasOwn(supplied, "marks_per_question")) delete input.marksPerQuestion;
+    if (Object.hasOwn(supplied, "exam_mode")) delete input.examMode;
+    if (Object.hasOwn(supplied, "exam_format")) delete input.examFormat;
+    if (Object.hasOwn(supplied, "topic_subject")) delete input.topicSubject;
+    if (Object.hasOwn(supplied, "rule_template")) delete input.ruleTemplate;
+  }
   const title = asString(input.title);
   if (!/^[a-z0-9-]{2,64}$/.test(id)) {
     throw new Error("Exam id must be lowercase letters, numbers and dashes.");
@@ -1000,10 +1025,11 @@ export async function saveExam(
       : 1;
 
   const questionCountRaw = Number((input as Record<string, unknown>).questionCount ?? (input as Record<string, unknown>).question_count ?? (input as Record<string, unknown>).totalQuestions ?? 0);
-  const requestedQuestionCount =
-    Number.isFinite(questionCountRaw) && questionCountRaw > 0
-      ? Math.floor(questionCountRaw)
-      : 0;
+  if (!Number.isInteger(questionCountRaw) || questionCountRaw < 0 || questionCountRaw > MAX_EXAM_QUESTIONS) {
+    throw new Error(`Total questions must be an integer between 0 and ${MAX_EXAM_QUESTIONS}.`);
+  }
+  const requestedQuestionCount = questionCountRaw;
+  const carriesCount = ["questionCount", "question_count", "totalQuestions"].some((key) => Object.hasOwn(input, key));
 
   // Per-exam marking settings (Admin → Public Exam Control).
   let negativeEnabled = input.negativeEnabled === true;
@@ -1053,7 +1079,7 @@ export async function saveExam(
   // otherwise fall back to existing linked-question totals for backward compatibility.
   let questionCount: number;
   let totalMarks: number;
-  if (requestedQuestionCount > 0) {
+  if (carriesCount) {
     questionCount = requestedQuestionCount;
     totalMarks = questionCount * marksPerQuestion;
   } else if (totals[0]?.count && totals[0]?.count > 0) {
@@ -1066,12 +1092,8 @@ export async function saveExam(
     totalMarks = fallbackMarks || (questionCount ? questionCount * marksPerQuestion : 0);
   }
 
-  const existing = await query<{ id: string; status: string }[]>(
-    `SELECT id, status FROM exams WHERE id = ? LIMIT 1`,
-    [id],
-  );
-  const isNew = existing.length === 0;
-  const previousStatus = isNew ? null : (existing[0]?.status ?? null);
+  const isNew = stored.length === 0;
+  previousStatus = stored[0]?.status ?? null;
   // ── Flow 5 exam category (additive; NULL keeps the legacy Exam flow) ──
   // Topic-wise exams must carry one subject; other formats never keep one
   // (prevents mixing categories). When the caller does not send these keys
@@ -1105,10 +1127,7 @@ export async function saveExam(
   } else if (examFormat !== "topic-wise") {
     topicSubject = null;
   }
-  // Single transaction: exam upsert + default rules + question slots + course
-  // sync + scope mirror — all succeed or all roll back (same withTransaction
-  // pattern as saveQuestionsBulk). Reads above stay outside; only writes are
-  // inside.
+  // The exam lock, dependent reads, and writes share one transaction.
   const examParams: unknown[] = [
     id,
     title,
@@ -1162,148 +1181,56 @@ export async function saveExam(
        featured = VALUES(featured),
        scheduled_at = VALUES(scheduled_at), ends_at = VALUES(ends_at),
        answer_key = VALUES(answer_key), created_by = VALUES(created_by)`;
-  await withTransaction(async (conn) => {
     await conn.query(examUpsertSql, examParams);
 
     // New exams start with their template's rule set from the central Exam
     // Rules page — fully editable/deletable afterwards from Exam Control.
     if (isNew) {
-      try {
-        const [have] = await conn.query(`SELECT id FROM exam_rules WHERE exam_id = ? LIMIT 1`, [id]);
-        if ((have as unknown[]).length === 0) {
-          const { normalizeTemplate, normalizeLang } = await import("@/lib/exam-rule-templates");
-          let seeded = false;
-          try {
-            for (const lang of ["bangla", "english"] as const) {
-              const [tpl] = await conn.query(
-                `SELECT rule_title, rule_text, sort_order FROM exam_rule_template_items WHERE template = ? AND lang = ? ORDER BY sort_order ASC`,
-                [normalizeTemplate(resolvedRuleTemplate), normalizeLang(lang)],
-              );
-              const tplRows = tpl as unknown as { rule_title: string | null; rule_text: string; sort_order: number }[];
-              const rows =
-                tplRows.length > 0
-                  ? tplRows.map((r) => ({ title: r.rule_title ?? "", text: r.rule_text, sortOrder: r.sort_order }))
-                  : buildDefaultExamRules(id, resolvedRuleTemplate, lang).map((r) => ({ title: r.title, text: r.text, sortOrder: r.sortOrder }));
-              for (const r of rows) {
-                await conn.query(
-                  `INSERT INTO exam_rules (exam_id, lang, rule_title, rule_text, sort_order) VALUES (?, ?, ?, ?, ?)`,
-                  [id, lang, r.title, r.text, r.sortOrder],
-                );
-              }
-            }
-            seeded = true;
-          } catch {
-            seeded = false;
-          }
-          if (!seeded) {
-            for (const lang of ["bangla", "english"] as const) {
-              const rules = buildDefaultExamRules(id, resolvedRuleTemplate, lang);
-              for (const rule of rules) {
-                await conn.query(
-                  `INSERT INTO exam_rules (exam_id, lang, rule_title, rule_text, sort_order) VALUES (?, ?, ?, ?, ?)`,
-                  [rule.examId, lang, rule.title, rule.text, rule.sortOrder],
-                );
-              }
-            }
+      const have = await optionalTableQuery(conn, `SELECT id FROM exam_rules WHERE exam_id = ? LIMIT 1`, [id]);
+      if (have !== null && (have as unknown[]).length === 0) {
+        const { normalizeTemplate, normalizeLang } = await import("@/lib/exam-rule-templates");
+        for (const lang of ["bangla", "english"] as const) {
+          const tpl = await optionalTableQuery(conn,
+            `SELECT rule_title, rule_text, sort_order FROM exam_rule_template_items WHERE template = ? AND lang = ? ORDER BY sort_order ASC`,
+            [normalizeTemplate(resolvedRuleTemplate), normalizeLang(lang)],
+          );
+          const templateRows = (tpl ?? []) as { rule_title: string | null; rule_text: string; sort_order: number }[];
+          const rules = templateRows.length > 0
+            ? templateRows.map((row) => ({ title: row.rule_title ?? "", text: row.rule_text, sortOrder: row.sort_order }))
+            : buildDefaultExamRules(id, resolvedRuleTemplate, lang);
+          for (const rule of rules) {
+            await conn.query(`INSERT INTO exam_rules (exam_id, lang, rule_title, rule_text, sort_order) VALUES (?, ?, ?, ?, ?)`,
+              [id, lang, rule.title, rule.text, rule.sortOrder]);
           }
         }
-      } catch {
-        // Best effort — rules can still be added manually.
       }
     }
 
-    // Auto-generate question slots when exam is created with question_count = N
+    // Count changes preserve permanent IDs and authored content, including
+    // inactive overflow referenced by historical answer sheets.
+    await createMissingQuestionSlots(conn, id, questionCount, marksPerQuestion);
+    await conn.query(
+      `UPDATE exam_questions SET is_active = 0 WHERE exam_id = ? AND sort_order > ? AND is_active <> 0`,
+      [id, questionCount],
+    );
     if (questionCount > 0) {
-      try {
-        const [have] = await conn.query(
-          `SELECT sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC`,
-          [id],
-        );
-        const existingOrders = new Set((have as unknown as { sort_order: number }[]).map((r) => Number(r.sort_order)));
-        const missing: number[] = [];
-        for (let i = 1; i <= questionCount; i += 1) {
-          if (!existingOrders.has(i)) missing.push(i);
-        }
-        if (missing.length > 0) {
-          let marksPerSlot = marksPerQuestion;
-          try {
-            const [examRows] = await conn.query(`SELECT marks_per_question FROM exams WHERE id = ? LIMIT 1`, [id]);
-            const raw = Number((examRows as unknown as { marks_per_question: string | number | null }[])[0]?.marks_per_question ?? marksPerQuestion);
-            if (Number.isFinite(raw) && raw > 0) marksPerSlot = raw;
-          } catch {
-            // Keep input-derived marks.
-          }
-          const placeholders = missing.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
-          const values: unknown[] = [];
-          for (const order of missing) {
-            // correct_index 0 (not NULL): production schema is NOT NULL
-            // DEFAULT 0 — NULL fails the whole slot insert. Answer is set
-            // when the admin fills the slot.
-            values.push(id, "", "", null, JSON.stringify(["", "", "", ""]), 0, null, marksPerSlot, order, 1);
-          }
-          await conn.query(
-            `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
-             VALUES ${placeholders}`,
-            values,
-          );
-        }
-      } catch {
-        // Best effort — slots may be created on next edit.
-      }
-      // Total Questions is the paper definition: slots beyond N leave the
-      // paper (content preserved, reactivatable), and leftover empty slots
-      // inside 1..N come back. Nothing is ever deleted, so result history
-      // and authored content always survive a count change.
-      try {
-        await conn.query(
-          `UPDATE exam_questions SET is_active = 0
-            WHERE exam_id = ? AND sort_order > ? AND is_active <> 0`,
-          [id, questionCount],
-        );
-      } catch {
-        // Best effort — surplus stays visible until the next save.
-      }
-      try {
-        const [inRange] = await conn.query(
-          `SELECT q.id FROM exam_questions q
-             LEFT JOIN exam_question_variants v ON v.question_id = q.id
-            WHERE q.exam_id = ? AND q.sort_order <= ? AND q.is_active = 0
-              AND (q.question IS NULL OR q.question = '')
-              AND (q.question_image IS NULL OR q.question_image = '')
-              AND (q.options IS NULL OR q.options = ''
-                   OR q.options = '[]' OR q.options = '["","","",""]')
-            GROUP BY q.id HAVING COUNT(v.question_id) = 0`,
-          [id, questionCount],
-        );
-        const emptyIds = (inRange as unknown as { id: number }[]).map((r) => Number(r.id));
-        if (emptyIds.length > 0) {
-          const ph = emptyIds.map(() => "?").join(",");
-          await conn.query(
-            `UPDATE exam_questions SET is_active = 1 WHERE id IN (${ph})`,
-            emptyIds,
-          );
-        }
-      } catch {
-        // Best effort — empty slots stay hidden until reactivated manually.
-      }
-      // Stored totals follow the live paper so the configured count and the
-      // displayed count can never drift apart again.
-      try {
-        const [totRows] = await conn.query(
-          `SELECT COUNT(*) AS count, SUM(marks) AS marks FROM exam_questions
-            WHERE exam_id = ? AND is_active = 1`,
-          [id],
-        );
-        const tot = (totRows as unknown as { count: number; marks: string | null }[])[0];
-        await conn.query(`UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`, [
-          tot?.count ?? 0,
-          Number(tot?.marks ?? 0) || 0,
-          id,
-        ]);
-      } catch {
-        // Best effort — readers recompute live totals anyway.
+      const emptySlotsSql = `SELECT q.id FROM exam_questions q
+        WHERE q.exam_id = ? AND q.sort_order BETWEEN 1 AND ? AND q.is_active = 0
+          AND (q.question IS NULL OR q.question = '')
+          AND (q.question_image IS NULL OR q.question_image = '')
+          AND (q.options IS NULL OR q.options = '[]' OR q.options = '["","","",""]')`;
+      const slotsSql = emptySlotsSql;
+      const variantFree = await optionalTableQuery(conn,
+        slotsSql + ` AND NOT EXISTS (SELECT 1 FROM exam_question_variants v WHERE v.question_id = q.id)`,
+        [id, questionCount],
+      );
+      const emptyRows = variantFree ?? (await conn.query(slotsSql, [id, questionCount]))[0];
+      const emptyIds = (emptyRows as { id: number }[]).map((row) => Number(row.id));
+      if (emptyIds.length > 0) {
+        await conn.query(`UPDATE exam_questions SET is_active = 1 WHERE id IN (${emptyIds.map(() => "?").join(",")})`, emptyIds);
       }
     }
+    await recomputeExamTotals(conn, id);
 
     // Keep course assignments in sync (COURSE scope).
     // Chapter-linked course exams (chapter_id chain) keep working with an empty
@@ -1317,10 +1244,9 @@ export async function saveExam(
     // legacy DBs where the column may not exist yet.
     try {
       await conn.query(`UPDATE exams SET type = ? WHERE id = ?`, [scope === "COURSE" ? "course" : "public", id]);
-    } catch {
-      // Best effort — kind remains the source of truth.
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "ER_BAD_FIELD_ERROR") throw error;
     }
-  });
 
   const rows = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? LIMIT 1`, [id]);
   if (!rows[0]) throw new Error("Failed to save the exam.");
@@ -1328,21 +1254,21 @@ export async function saveExam(
   exam.courseIds = courseIds;
   exam.chapterId = chapterId;
   exam.scope = scope;
+  return exam;
+  });
   invalidateExamsCache();
   // Automatic publish notifications (Notification Control):
   //  - PUBLIC exam newly published → all students ("New Public Exam Published")
   //  - COURSE exam newly added/published → enrolled students of THOSE courses
   // Fires only on creation-as-published or the draft → published transition,
   // never on plain edits. Fully non-blocking + exactly-once.
-  const becamePublished =
-    ["draft", "published", "closed"].includes(String(input.status)) &&
-    String(input.status) === "published" &&
-    previousStatus !== "published";
+  const becamePublished = exam.status === "published" && previousStatus !== "published";
   if (becamePublished) {
-    const scopeSnapshot = scope;
-    const courseIdsSnapshot = [...courseIds];
-    const chapterSnapshot = chapterId;
-    const titleSnapshot = title;
+    const id = exam.id;
+    const scopeSnapshot = exam.scope;
+    const courseIdsSnapshot = [...exam.courseIds];
+    const chapterSnapshot = exam.chapterId;
+    const titleSnapshot = exam.title;
     void import("@/lib/notification-events")
       .then((events) => {
         if (scopeSnapshot === "COURSE") {
@@ -1383,11 +1309,16 @@ export async function reorderExams(orderedIds: string[]): Promise<void> {
 export async function deleteExam(id: string): Promise<void> {
   await ensureTables();
   await withTransaction(async (conn) => {
+    const [rows] = await conn.query(`SELECT id FROM exams WHERE id = ? FOR UPDATE`, [id]);
+    if ((rows as unknown[]).length === 0) return;
+    for (const table of ["exam_question_variants", "question_translations", "exam_question_options"]) {
+      await optionalTableQuery(conn, "DELETE child FROM " + table + " child INNER JOIN exam_questions q ON q.id = child.question_id WHERE q.exam_id = ?", [id]);
+    }
+    for (const table of ["exam_attempt_answers", "exam_attempts", "exam_sessions", "exam_rankings", "exam_sets", "exam_enrollments", "exam_results", "exam_rules"]) {
+      await optionalTableQuery(conn, "DELETE FROM " + table + " WHERE exam_id = ?", [id]);
+    }
     await conn.query(`DELETE FROM exam_questions WHERE exam_id = ?`, [id]);
-    await conn.query(`DELETE FROM exam_enrollments WHERE exam_id = ?`, [id]);
-    await conn.query(`DELETE FROM exam_results WHERE exam_id = ?`, [id]);
     await conn.query(`DELETE FROM exam_courses WHERE exam_id = ?`, [id]);
-    await conn.query(`DELETE FROM exam_rules WHERE exam_id = ?`, [id]);
     await conn.query(`DELETE FROM exams WHERE id = ?`, [id]);
   });
   invalidateExamsCache();
@@ -1397,6 +1328,7 @@ export async function deleteExam(id: string): Promise<void> {
 
 export async function fetchQuestions(
   filters: { examId?: string; subject?: string } = {},
+  options: { throwOnError?: boolean } = {},
 ): Promise<ExamQuestion[]> {
   try {
     await ensureTables();
@@ -1415,347 +1347,263 @@ export async function fetchQuestions(
     const sql = `SELECT * FROM exam_questions ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY sort_order ASC, id ASC LIMIT 500`;
     const rows = await query<QuestionRow[]>(sql, params);
     return rows.map(rowToQuestion);
-  } catch {
+  } catch (error) {
+    if (options.throwOnError) throw error;
     return [];
   }
 }
 
-export async function saveQuestion(
-  input: Record<string, unknown>,
-): Promise<ExamQuestion[]> {
-  await ensureTables();
-  const questionImageEarly =
-    asString((input as Record<string, unknown>).questionImage as string) ||
-    asString((input as Record<string, unknown>).question_image as string) ||
-    null;
+type QuestionWrite = {
+  id: number | null; order: number | null; subject: string; text: string;
+  image: string | null; options: string[]; correctIndex: number;
+  explanation: string | null; marks: number; active: number;
+};
+
+function validateQuestion(input: Record<string, unknown>): QuestionWrite {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid question payload.");
+  const image = asString(input.questionImage) || asString(input.question_image) || null;
   const text = asString(input.question);
-  if (text.length < 3 && !questionImageEarly) throw new Error("Question text or image is required (add at least 3 characters or an image).");
-  const options = Array.isArray(input.options)
-    ? input.options.map((option) => String(option))
-    : [];
-  if (options.length < 2 || options.some((option) => option.length === 0)) {
-    throw new Error("At least two non-empty options are required.");
+  if (text.length < 3 && !image) throw new Error("Question text or image is required.");
+  const options = Array.isArray(input.options) ? input.options.map((option) => typeof option === "string" ? option.trim() : "") : [];
+  if (options.length < 2 || options.length > 4 || options.some((option) => !option)) throw new Error("Two to four non-empty options are required.");
+  const correctIndex = strictAnswerIndex(input.correctIndex, options.length);
+  if (correctIndex === null) throw new Error("Correct answer is missing or invalid — select A, B, C or D.");
+  const marks = input.marks === undefined ? 1 : Number(input.marks);
+  if (!Number.isFinite(marks) || marks < 0.5 || marks > 100) throw new Error("Marks must be between 0.5 and 100.");
+  const id = input.id === undefined || input.id === null ? null : Number(input.id);
+  if (id !== null && (typeof input.id === "boolean" || !Number.isSafeInteger(id) || id <= 0)) throw new Error("Invalid question id.");
+  const order = input.order === undefined || input.order === null ? null : Number(input.order);
+  if (order !== null && (typeof input.order === "boolean" || !Number.isInteger(order) || order < 1 || order > MAX_EXAM_QUESTIONS)) throw new Error("Invalid question slot order.");
+  return { id, order, subject: asString(input.subject), text, image, options, correctIndex,
+    explanation: asString(input.explanation) || null, marks, active: input.isActive === false ? 0 : 1 };
+}
+
+async function writeQuestions(examId: string | null, items: Record<string, unknown>[]): Promise<number[]> {
+  const clean = items.map(validateQuestion);
+  const suppliedIds = clean.flatMap((item) => item.id === null ? [] : [item.id]);
+  const suppliedOrders = clean.flatMap((item) => item.order === null ? [] : [item.order]);
+  if (new Set(suppliedIds).size !== suppliedIds.length || new Set(suppliedOrders).size !== suppliedOrders.length) {
+    throw new Error("Duplicate question ids or slot orders in this batch.");
   }
-  // Strict: missing/malformed answers are rejected loudly — never stored as A.
-  const correctIndex = strictAnswerIndex(input.correctIndex as unknown, options.length);
-  if (correctIndex === null) {
-    throw new Error("Correct answer is missing or invalid — select A, B, C or D.");
-  }
-  const marks = Math.max(0.5, Number(input.marks) || 1);
-  if (!Number.isFinite(marks) || marks <= 0) throw new Error("Marks must be a positive number.");
-  const orderRaw = Number(input.order);
-  const explicitOrder = Number.isInteger(orderRaw) && orderRaw > 0 ? orderRaw : null;
+  return withTransaction(async (conn) => {
+    if (examId) await lockExam(conn, examId);
+    const [slotRows] = await conn.query(
+      `SELECT id, exam_id, sort_order FROM exam_questions WHERE ` + (examId ? "exam_id = ?" : "exam_id IS NULL") + " ORDER BY sort_order ASC, id ASC FOR UPDATE",
+      examId ? [examId] : [],
+    );
+    const slots = slotRows as { id: number; exam_id: string | null; sort_order: number }[];
+    let nextOrder = Math.max(0, ...slots.map((slot) => Number(slot.sort_order))) + 1;
+    const usedIds = new Set<number>();
+    const ids: number[] = [];
+    for (const item of clean) {
+      let slot = item.id === null ? undefined : slots.find((row) => Number(row.id) === item.id);
+      if (item.id !== null && !slot) throw new Error("Question " + item.id + " does not belong to this exam/bank. Attach a copy instead of moving permanent IDs.");
+      if (item.order !== null) {
+        const matching = slots.filter((row) => Number(row.sort_order) === item.order);
+        if (matching.length > 1) throw new Error("Duplicate question slot orders must be repaired before saving.");
+        if (slot && matching[0] && Number(matching[0].id) !== Number(slot.id)) throw new Error("Question slot is already occupied.");
+        if (!slot) slot = matching[0];
+      }
+      const order = item.order ?? (slot ? Number(slot.sort_order) : nextOrder++);
+      if (examId && (order < 1 || order > MAX_EXAM_QUESTIONS)) throw new Error("Exam question limit exceeded.");
+      const values = [examId, item.subject, item.text, item.image, JSON.stringify(item.options), item.correctIndex,
+        item.explanation, item.marks, order, item.active];
+      if (slot) {
+        const id = Number(slot.id);
+        if (usedIds.has(id)) throw new Error("The same question slot was supplied more than once.");
+        await conn.query(`UPDATE exam_questions SET exam_id = ?, bank_subject = ?, question = ?, question_image = ?, options = ?, correct_index = ?, explanation = ?, marks = ?, sort_order = ?, is_active = ? WHERE id = ?`, [...values, id]);
+        usedIds.add(id);
+        ids.push(id);
+        slot.sort_order = order;
+      } else {
+        const [result] = await conn.query(`INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, values);
+        const id = Number((result as { insertId?: number }).insertId);
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Database did not return the saved question id.");
+        ids.push(id);
+        usedIds.add(id);
+        slots.push({ id, exam_id: examId, sort_order: order });
+      }
+      nextOrder = Math.max(nextOrder, order + 1);
+    }
+    await recomputeExamTotals(conn, examId);
+    return ids;
+  });
+}
+
+export async function saveQuestion(input: Record<string, unknown>): Promise<ExamQuestion[]> {
+  await ensureTables();
   const examId = asString(input.examId) || null;
-  const questionImage = questionImageEarly;
-  const values = [
-    examId,
-    asString(input.subject),
-    text,
-    questionImage,
-    JSON.stringify(options),
-    correctIndex,
-    asString(input.explanation) || null,
-    marks,
-    input.isActive === false ? 0 : 1,
-  ];
-
-  const existingId = Number(input.id);
-  if (Number.isInteger(existingId) && existingId > 0) {
-    // Update an existing question (possibly moving it between exams/bank).
-    const current = await query<{ exam_id: string | null }[]>(
-      `SELECT exam_id FROM exam_questions WHERE id = ? LIMIT 1`,
-      [existingId],
-    );
-    if (!current[0]) throw new Error("Question not found.");
-    const orderClause = explicitOrder !== null ? `, sort_order = ${explicitOrder}` : "";
-    await exec(
-      `UPDATE exam_questions SET exam_id = ?, bank_subject = ?, question = ?, question_image = ?,
-         options = ?, correct_index = ?, explanation = ?, marks = ?, is_active = ?${orderClause}
-       WHERE id = ?`,
-      [...values, existingId],
-    );
-    await recomputeExamTotals(current[0].exam_id);
-    await recomputeExamTotals(examId);
-    invalidateExamsCache();
-    return fetchQuestions({ examId: examId ?? "bank", subject: asString(input.subject) });
-  }
-
-  // New question: assign next sort_order within this exam/bank scope.
-  let nextOrder = 1;
-  if (examId) {
-    try {
-      const max = await query<{ m: number | null }[]>(`SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ?`, [examId]);
-      nextOrder = (max[0]?.m ?? 0) + 1;
-    } catch {
-      nextOrder = 1;
-    }
-  } else {
-    try {
-      const max = await query<{ m: number | null }[]>(`SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id IS NULL`);
-      nextOrder = (max[0]?.m ?? 0) + 1;
-    } catch {
-      nextOrder = 1;
-    }
-  }
-  const sortOrder = explicitOrder ?? nextOrder;
-  await exec(
-    `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], sortOrder, values[8]],
-  );
-  await recomputeExamTotals(examId);
+  if (examId && !/^[a-z0-9-]{2,64}$/.test(examId)) throw new Error("Invalid exam id.");
+  await writeQuestions(examId, [input]);
   invalidateExamsCache();
   return fetchQuestions({ examId: examId ?? "bank", subject: asString(input.subject) });
 }
 
-/**
- * Bulk save — saves multiple questions for one exam in a single request.
- * Only touches supplied items, preserves untouched questions, and recomputes
- * exam totals once at the end (vs per-question). Returns the exam's fresh
- * question list so the client can sync IDs without a second fetch.
- */
-export async function saveQuestionsBulk(
-  examId: string,
-  items: Record<string, unknown>[],
-): Promise<{ questions: ExamQuestion[]; savedIds: number[] }> {
+/** Save a batch atomically, preserving slot IDs and the supplied ID order. */
+export async function saveQuestionsBulk(examId: string, items: Record<string, unknown>[]): Promise<{ questions: ExamQuestion[]; savedIds: number[] }> {
   await ensureTables();
   const cleanExamId = asString(examId);
-  if (!cleanExamId || !/^[a-z0-9-]{2,64}$/.test(cleanExamId)) throw new Error("Invalid exam id.");
+  if (!/^[a-z0-9-]{2,64}$/.test(cleanExamId)) throw new Error("Invalid exam id.");
   if (!Array.isArray(items) || items.length === 0) throw new Error("No questions to save.");
   if (items.length > 200) throw new Error("Too many questions in one batch (max 200).");
-
-  // Validate all items upfront (fast fail, no DB work on invalid payload)
-  for (let idx = 0; idx < items.length; idx += 1) {
-    const input = items[idx] as Record<string, unknown>;
-    const qImage =
-      asString((input as Record<string, unknown>).questionImage as string) ||
-      asString((input as Record<string, unknown>).question_image as string) ||
-      null;
-    const text = asString(input.question);
-    if (text.length < 3 && !qImage) throw new Error(`Q${String(idx + 1).padStart(2, "0")}: Question text or image is required.`);
-    const options = Array.isArray(input.options) ? input.options.map((o) => String(o)) : [];
-    if (options.length < 2 || options.some((o) => o.length === 0)) throw new Error(`Q${String(idx + 1).padStart(2, "0")}: At least two non-empty options are required.`);
-    // Strict: missing/malformed answers fail loudly — never stored as A.
-    const correctIndex = strictAnswerIndex(input.correctIndex as unknown, options.length);
-    if (correctIndex === null) throw new Error(`Q${String(idx + 1).padStart(2, "0")}: Correct answer is missing or invalid — select A, B, C or D.`);
-    const marks = Math.max(0.5, Number(input.marks) || 1);
-    if (!Number.isFinite(marks) || marks <= 0) throw new Error(`Q${String(idx + 1).padStart(2, "0")}: Marks must be positive.`);
-  }
-
-  // Single transaction: all updates/inserts + totals recompute atomically on one connection.
-  const savedIds = await withTransaction(async (conn) => {
-    const ids: number[] = [];
-    // Determine next sort_order once
-    let nextOrder = 1;
-    try {
-      const [rows] = await conn.query(`SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ?`, [cleanExamId]);
-      const r = rows as unknown as { m: number | null }[];
-      nextOrder = (r[0]?.m ?? 0) + 1;
-    } catch {
-      nextOrder = 1;
-    }
-
-    for (let idx = 0; idx < items.length; idx += 1) {
-      const input = items[idx] as Record<string, unknown>;
-      const qImage =
-        asString((input as Record<string, unknown>).questionImage as string) ||
-        asString((input as Record<string, unknown>).question_image as string) ||
-        null;
-      const text = asString(input.question);
-      const options = Array.isArray(input.options) ? input.options.map((o) => String(o)) : [];
-      const correctIndex = Number(input.correctIndex);
-      const marks = Math.max(0.5, Number(input.marks) || 1);
-      const orderRaw = Number(input.order);
-      const explicitOrder = Number.isInteger(orderRaw) && orderRaw > 0 ? orderRaw : null;
-      const subject = asString(input.subject);
-      const explanation = asString(input.explanation) || null;
-      const isActive = input.isActive === false ? 0 : 1;
-      const existingId = Number(input.id);
-      if (Number.isInteger(existingId) && existingId > 0) {
-        const [curRows] = await conn.query(`SELECT exam_id FROM exam_questions WHERE id = ? LIMIT 1`, [existingId]);
-        const cur = curRows as unknown as { exam_id: string | null }[];
-        if (!cur[0]) throw new Error(`Question ${existingId} not found.`);
-        const orderClause = explicitOrder !== null ? `, sort_order = ${explicitOrder}` : "";
-        await conn.query(
-          `UPDATE exam_questions SET exam_id = ?, bank_subject = ?, question = ?, question_image = ?, options = ?, correct_index = ?, explanation = ?, marks = ?, is_active = ?${orderClause} WHERE id = ?`,
-          [cleanExamId, subject, text, qImage, JSON.stringify(options), correctIndex, explanation, marks, isActive, existingId],
-        );
-        ids.push(existingId);
-      } else {
-        const sortOrder = explicitOrder ?? nextOrder++;
-        const [result] = await conn.query(
-          `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [cleanExamId, subject, text, qImage, JSON.stringify(options), correctIndex, explanation, marks, sortOrder, isActive],
-        );
-        const insertId = (result as unknown as { insertId?: number })?.insertId;
-        if (insertId) ids.push(Number(insertId));
-      }
-    }
-    // Recompute exam totals once, within transaction (single connection, no extra pool roundtrip)
-    try {
-      const [totRows] = await conn.query(`SELECT COUNT(*) AS count, SUM(marks) AS marks FROM exam_questions WHERE exam_id = ? AND is_active = 1`, [cleanExamId]);
-      const tot = (totRows as unknown as { count: number; marks: string | null }[])[0];
-      await conn.query(`UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`, [tot?.count ?? 0, Number(tot?.marks ?? 0) || 0, cleanExamId]);
-    } catch {
-      // Best-effort
-    }
-    return ids;
-  });
-
-  // Fetch fresh questions outside transaction (one query) — keeps read after commit consistent
-  const questions = await fetchQuestions({ examId: cleanExamId });
-  // Populate any missing insertIds from fresh list (e.g. if driver didn't return insertId)
-  if (savedIds.length < items.length) {
-    const freshIds = questions.map((q) => q.id).filter((id): id is number => id !== null);
-    savedIds.length = 0;
-    freshIds.forEach((id) => savedIds.push(id));
-  }
-  // Invalidate exams cache so updated totals show immediately without stale 30s cache
+  const savedIds = await writeQuestions(cleanExamId, items);
   invalidateExamsCache();
-  return { questions, savedIds };
+  return { questions: await fetchQuestions({ examId: cleanExamId }), savedIds };
+}
+
+async function copyQuestion(conn: PoolConnection, source: QuestionRow, examId: string | null): Promise<number> {
+  const [rows] = await conn.query(`SELECT sort_order FROM exam_questions WHERE ` + (examId ? "exam_id = ?" : "exam_id IS NULL") + " FOR UPDATE", examId ? [examId] : []);
+  const order = Math.max(0, ...(rows as { sort_order: number }[]).map((row) => Number(row.sort_order))) + 1;
+  if (examId && order > MAX_EXAM_QUESTIONS) throw new Error("Exam question limit exceeded.");
+  const [result] = await conn.query(
+    `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [examId, source.bank_subject, source.question, source.question_image ?? null, source.options, source.correct_index,
+      source.explanation, source.marks, order, source.is_active],
+  );
+  const id = Number((result as { insertId?: number }).insertId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Database did not return the copied question id.");
+  await optionalTableQuery(conn,
+    `INSERT INTO exam_question_variants (question_id, lang, set_label, question, options, correct_index, explanation, marks, question_image)
+     SELECT ?, lang, set_label, question, options, correct_index, explanation, marks, question_image FROM exam_question_variants WHERE question_id = ?`,
+    [id, source.id],
+  );
+  return id;
 }
 
 export async function duplicateQuestion(id: number): Promise<ExamQuestion[]> {
   await ensureTables();
-  const rows = await query<QuestionRow[]>(`SELECT * FROM exam_questions WHERE id = ? LIMIT 1`, [id]);
-  const src = rows[0];
-  if (!src) throw new Error("Question not found.");
-  const next = await query<{ m: number | null }[]>(
-    src.exam_id ? `SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ?` : `SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id IS NULL`,
-    src.exam_id ? [src.exam_id] : [],
-  );
-  const sortOrder = (next[0]?.m ?? 0) + 1;
-  await withTransaction(async (conn) => {
-    const [result] = await conn.query(
-      `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [src.exam_id, src.bank_subject, src.question, (src as unknown as { question_image?: string | null }).question_image ?? null, src.options, src.correct_index, src.explanation, Math.max(0.5, Number(src.marks) || 1), sortOrder, 1],
-    );
-    const newId = (result as unknown as { insertId?: number })?.insertId;
-    // Carry the bilingual variant cells (bangla/english x set A/B) to the copy.
-    if (newId) {
-      try {
-        await conn.query(
-          `INSERT INTO exam_question_variants (question_id, lang, set_label, question, options, correct_index, explanation, marks, question_image)
-           SELECT ?, lang, set_label, question, options, correct_index, explanation, marks, question_image
-           FROM exam_question_variants WHERE question_id = ?`,
-          [newId, id],
-        );
-      } catch {
-        // Best effort — variants table may not exist yet.
-      }
-    }
+  const examId = await withTransaction(async (conn) => {
+    const [rows] = await conn.query(`SELECT * FROM exam_questions WHERE id = ? FOR UPDATE`, [id]);
+    const source = (rows as QuestionRow[])[0];
+    if (!source) throw new Error("Question not found.");
+    if (source.exam_id) await lockExam(conn, source.exam_id);
+    await copyQuestion(conn, source, source.exam_id);
+    await recomputeExamTotals(conn, source.exam_id);
+    return source.exam_id;
   });
-  await recomputeExamTotals(src.exam_id);
   invalidateExamsCache();
-  return fetchQuestions({ examId: src.exam_id ?? "bank" });
+  return fetchQuestions({ examId: examId ?? "bank" });
 }
 
 export async function reorderQuestions(examId: string | null, orderedIds: number[]): Promise<ExamQuestion[]> {
   await ensureTables();
+  if (orderedIds.length === 0 || orderedIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(orderedIds).size !== orderedIds.length) {
+    throw new Error("Invalid or duplicate question ids.");
+  }
   await withTransaction(async (conn) => {
-    for (let index = 0; index < orderedIds.length; index += 1) {
-      await conn.query(`UPDATE exam_questions SET sort_order = ? WHERE id = ? AND ${examId ? "exam_id = ?" : "exam_id IS NULL"}`, examId ? [index + 1, orderedIds[index], examId] : [index + 1, orderedIds[index]]);
+    if (examId) await lockExam(conn, examId);
+    const [rows] = await conn.query(`SELECT id FROM exam_questions WHERE ` + (examId ? "exam_id = ?" : "exam_id IS NULL") + " ORDER BY sort_order ASC, id ASC FOR UPDATE", examId ? [examId] : []);
+    const existing = (rows as { id: number }[]).map((row) => Number(row.id));
+    if (orderedIds.some((id) => !existing.includes(id))) throw new Error("Question does not belong to this exam/bank.");
+    // Reordering a filtered subset must not collide with untouched slots.
+    const selected = new Set(orderedIds);
+    let next = 0;
+    const reordered = existing.map((id) => selected.has(id) ? orderedIds[next++] : id);
+    for (let index = 0; index < reordered.length; index += 1) {
+      await conn.query(`UPDATE exam_questions SET sort_order = ? WHERE id = ?`, [index + 1, reordered[index]]);
     }
   });
-  const key = examId ?? "bank";
   invalidateExamsCache();
-  return fetchQuestions({ examId: key });
+  return fetchQuestions({ examId: examId ?? "bank" });
 }
 
-/** Attach a copy of a reusable bank question to an exam. */
-export async function attachBankQuestion(
-  questionId: number,
-  examId: string,
-): Promise<ExamQuestion[]> {
+/** Copy bank content and variants; never move a permanent question ID. */
+export async function attachBankQuestion(questionId: number, examId: string): Promise<ExamQuestion[]> {
   await ensureTables();
-  if (!/^[a-z0-9-]{2,64}$/.test(examId)) {
-    throw new Error("Invalid exam id.");
-  }
-  const source = await query<
-    { bank_subject: string; question: string; question_image: string | null; options: string; correct_index: number; explanation: string | null; marks: string | number }[]
-  >(
-    `SELECT bank_subject, question, question_image, options, correct_index, explanation, marks
-     FROM exam_questions WHERE id = ? AND exam_id IS NULL LIMIT 1`,
-    [questionId],
-  );
-  const src = source[0];
-  if (!src) throw new Error("Bank question not found.");
-  // Append at the end (MAX sort_order + 1) so the copy never collides with an
-  // existing slot order.
-  let nextOrder = 1;
-  try {
-    const max = await query<{ m: number | null }[]>(`SELECT MAX(sort_order) AS m FROM exam_questions WHERE exam_id = ?`, [examId]);
-    nextOrder = (max[0]?.m ?? 0) + 1;
-  } catch {
-    nextOrder = 1;
-  }
-  await exec(
-    `INSERT INTO exam_questions (exam_id, bank_subject, question, question_image, options, correct_index, explanation, marks, sort_order, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-    [examId, src.bank_subject, src.question, (src as unknown as { question_image?: string | null }).question_image ?? null, src.options, src.correct_index, src.explanation, Math.max(0.5, Number(src.marks) || 1), nextOrder],
-  );
-  await recomputeExamTotals(examId);
+  if (!/^[a-z0-9-]{2,64}$/.test(examId)) throw new Error("Invalid exam id.");
+  await withTransaction(async (conn) => {
+    await lockExam(conn, examId);
+    const [rows] = await conn.query(`SELECT * FROM exam_questions WHERE id = ? AND exam_id IS NULL FOR UPDATE`, [questionId]);
+    const source = (rows as QuestionRow[])[0];
+    if (!source) throw new Error("Bank question not found.");
+    await copyQuestion(conn, source, examId);
+    await recomputeExamTotals(conn, examId);
+  });
   invalidateExamsCache();
   return fetchQuestions({ examId });
 }
 
 export async function deleteQuestion(id: number): Promise<void> {
   await ensureTables();
-  const rows = await query<{ exam_id: string | null }[]>(
-    `SELECT exam_id FROM exam_questions WHERE id = ? LIMIT 1`,
-    [id],
-  );
   await withTransaction(async (conn) => {
-    // Explicit variant cleanup alongside the FK CASCADE — legacy DBs may lack
-    // the constraint, and orphans would otherwise leak into variant lookups.
-    try {
-      await conn.query(`DELETE FROM exam_question_variants WHERE question_id = ?`, [id]);
-    } catch {
-      // Best effort — variants table may not exist yet.
+    const [rows] = await conn.query(`SELECT exam_id FROM exam_questions WHERE id = ? FOR UPDATE`, [id]);
+    const row = (rows as { exam_id: string | null }[])[0];
+    if (!row) return;
+    if (row.exam_id) {
+      await lockExam(conn, row.exam_id);
+      const results = await optionalTableQuery(conn, `SELECT id FROM exam_results WHERE exam_id = ? LIMIT 1`, [row.exam_id]);
+      const attempts = await optionalTableQuery(conn, `SELECT exam_id FROM exam_attempts WHERE exam_id = ? LIMIT 1`, [row.exam_id]);
+      if ((results as unknown[] | null)?.length || (attempts as unknown[] | null)?.length) {
+        // Result details and locked attempts reference this permanent ID.
+        await conn.query(`UPDATE exam_questions SET is_active = 0 WHERE id = ?`, [id]);
+        await recomputeExamTotals(conn, row.exam_id);
+        return;
+      }
     }
+    await optionalTableQuery(conn, `DELETE FROM exam_question_variants WHERE question_id = ?`, [id]);
+    await optionalTableQuery(conn, `DELETE FROM question_translations WHERE question_id = ?`, [id]);
+    await conn.query(`DELETE FROM exam_question_options WHERE question_id = ?`, [id]);
+    await optionalTableQuery(conn, `DELETE FROM exam_attempt_answers WHERE question_id = ?`, [id]);
     await conn.query(`DELETE FROM exam_questions WHERE id = ?`, [id]);
+    await recomputeExamTotals(conn, row.exam_id);
   });
-  await recomputeExamTotals(rows[0]?.exam_id ?? null);
   invalidateExamsCache();
 }
 
-export async function duplicateExam(sourceId: string, adminUid: string): Promise<Exam> {
+/**
+ * `requestId` is a client-generated operation key. A replay of the same
+ * request (lost response, double click, network retry) returns the copy that
+ * the first attempt committed instead of creating another one.
+ */
+export async function duplicateExam(sourceId: string, adminUid: string, requestId?: string): Promise<Exam> {
   await ensureTables();
-  const rows = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? LIMIT 1`, [sourceId]);
+  const operationKey = typeof requestId === "string" ? requestId.trim().slice(0, 100) : "";
+  if (operationKey) {
+    await exec(`CREATE TABLE IF NOT EXISTS exam_duplicate_operations (
+      request_id VARCHAR(100) NOT NULL PRIMARY KEY,
+      source_id VARCHAR(64) NOT NULL,
+      new_exam_id VARCHAR(64) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  }
+  const exam = await withTransaction(async (conn) => {
+  const query = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
+    const [rows] = await conn.query(sql, params);
+    return rows as T;
+  };
+  if (operationKey) {
+    // Serialize replays of the same key on the source exam row, then replay.
+    await query(`SELECT id FROM exams WHERE id = ? FOR UPDATE`, [sourceId]);
+    const prior = (await query<{ request_id: string; source_id: string; new_exam_id: string }[]>(
+      `SELECT request_id, source_id, new_exam_id FROM exam_duplicate_operations WHERE request_id = ? FOR UPDATE`, [operationKey],
+    )).find((row) => row.request_id === operationKey);
+    if (prior) {
+      if (prior.source_id !== sourceId) throw new Error("This request id was already used for a different exam.");
+      const existing = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? LIMIT 1`, [prior.new_exam_id]);
+      if (!existing[0]) throw new Error("The duplicated exam from this request no longer exists.");
+      const replayed = rowToExam(existing[0]);
+      const links = await query<{ course_id: string }[]>(`SELECT course_id FROM exam_courses WHERE exam_id = ?`, [prior.new_exam_id]);
+      replayed.courseIds = links.map((row) => row.course_id);
+      return replayed;
+    }
+  }
+  const rows = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? FOR UPDATE`, [sourceId]);
   const src = rows[0];
   if (!src) throw new Error("Exam not found.");
   const baseId = sourceId.replace(/-copy.*$/, "");
-  let newId = `${baseId}-copy-${Date.now().toString(36).slice(2, 6)}`.slice(0, 64).toLowerCase();
-  // Ensure uniqueness
-  let attempt = 0;
-  while (attempt < 5) {
-    const exists = await query<{ id: string }[]>(`SELECT id FROM exams WHERE id = ? LIMIT 1`, [newId]);
-    if (exists.length === 0) break;
-    newId = `${baseId}-copy-${Date.now().toString(36).slice(2, 6)}${attempt}`.slice(0, 64).toLowerCase();
-    attempt += 1;
-  }
+  // Reserve suffix space: truncating the entire ID used to remove the copy
+  // suffix for 64-character source IDs and retry the source ID itself.
+  const newId = `${baseId.slice(0, 46)}-copy-${randomUUID().slice(0, 12)}`;
   const newTitle = `${src.title} (Copy)`.slice(0, 255);
   // Preserve sort order: put duplicate after source
   const maxRows = await query<{ m: number | null }[]>(`SELECT MAX(sort_order) AS m FROM exams`);
   const nextOrder = (maxRows[0]?.m ?? 0) + 1;
-  // Read source payloads before the transaction (reads outside; copy writes atomic).
-  const qs = await query<QuestionRow[]>(`SELECT * FROM exam_questions WHERE exam_id = ?`, [sourceId]);
-  let ruleRows: { rule_title: string; rule_text: string; sort_order: number }[] = [];
-  try {
-    ruleRows = await query<{ rule_title: string; rule_text: string; sort_order: number }[]>(`SELECT rule_title, rule_text, sort_order FROM exam_rules WHERE exam_id = ? ORDER BY sort_order ASC`, [sourceId]);
-  } catch {
-    // rules table may not exist yet
-  }
-  let courseRows: { course_id: string }[] = [];
-  try {
-    courseRows = await query<{ course_id: string }[]>(`SELECT course_id FROM exam_courses WHERE exam_id = ?`, [sourceId]);
-  } catch {
-    // best effort
-  }
-  // Single transaction: exam + questions (+ their variants) + rules + course
-  // assignments + scope mirror + totals — a partial copy never persists.
-  await withTransaction(async (conn) => {
+  const qs = await query<QuestionRow[]>(`SELECT * FROM exam_questions WHERE exam_id = ? FOR UPDATE`, [sourceId]);
+  const ruleRows = (await optionalTableQuery(conn,
+    `SELECT lang, rule_title, rule_text, sort_order FROM exam_rules WHERE exam_id = ? ORDER BY sort_order ASC`, [sourceId],
+  ) ?? []) as { lang: string; rule_title: string; rule_text: string; sort_order: number }[];
+  const courseRows = await query<{ course_id: string }[]>(`SELECT course_id FROM exam_courses WHERE exam_id = ?`, [sourceId]);
+  // Source snapshot and every copy write share the same transaction.
     await conn.query(
       `INSERT INTO exams (${EXAM_COLUMNS}, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -1798,22 +1646,17 @@ export async function duplicateExam(sourceId: string, adminUid: string): Promise
         [newId, q.bank_subject, q.question, (q as unknown as { question_image?: string | null }).question_image ?? null, q.options, q.correct_index, q.explanation, q.marks, q.sort_order ?? 0, q.is_active],
       );
       const newQid = (result as unknown as { insertId?: number })?.insertId;
-      if (newQid) {
-        try {
-          await conn.query(
-            `INSERT INTO exam_question_variants (question_id, lang, set_label, question, options, correct_index, explanation, marks, question_image)
-             SELECT ?, lang, set_label, question, options, correct_index, explanation, marks, question_image
-             FROM exam_question_variants WHERE question_id = ?`,
-            [newQid, q.id],
-          );
-        } catch {
-          // Best effort — variants table may not exist yet.
-        }
-      }
+      if (!Number.isSafeInteger(Number(newQid)) || Number(newQid) <= 0) throw new Error("Database did not return the copied question id.");
+      await optionalTableQuery(conn,
+        `INSERT INTO exam_question_variants (question_id, lang, set_label, question, options, correct_index, explanation, marks, question_image)
+         SELECT ?, lang, set_label, question, options, correct_index, explanation, marks, question_image
+         FROM exam_question_variants WHERE question_id = ?`,
+        [newQid, q.id],
+      );
     }
     // Copy rules
     for (const r of ruleRows) {
-      await conn.query(`INSERT INTO exam_rules (exam_id, rule_title, rule_text, sort_order) VALUES (?, ?, ?, ?)`, [newId, r.rule_title, r.rule_text, r.sort_order]);
+      await conn.query(`INSERT INTO exam_rules (exam_id, lang, rule_title, rule_text, sort_order) VALUES (?, ?, ?, ?, ?)`, [newId, r.lang, r.rule_title, r.rule_text, r.sort_order]);
     }
     // Copy course assignments (same COURSE scope linkage as the source).
     for (const c of courseRows) {
@@ -1825,65 +1668,38 @@ export async function duplicateExam(sourceId: string, adminUid: string): Promise
         src.kind === "enrolled" ? "course" : "public",
         newId,
       ]);
-    } catch {
-      // Best effort — kind remains the source of truth.
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "ER_BAD_FIELD_ERROR") throw error;
     }
-    // Recompute totals inside the transaction (single connection).
-    try {
-      const [totRows] = await conn.query(`SELECT COUNT(*) AS count, SUM(marks) AS marks FROM exam_questions WHERE exam_id = ? AND is_active = 1`, [newId]);
-      const tot = (totRows as unknown as { count: number; marks: string | null }[])[0];
-      await conn.query(`UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`, [tot?.count ?? 0, Number(tot?.marks ?? 0) || 0, newId]);
-    } catch {
-      // Best-effort sync.
+    await recomputeExamTotals(conn, newId);
+    if (operationKey) {
+      await conn.query(
+        `INSERT INTO exam_duplicate_operations (request_id, source_id, new_exam_id) VALUES (?, ?, ?)`,
+        [operationKey, sourceId, newId],
+      );
     }
-  });
-  invalidateExamsCache();
   const newRows = await query<ExamRow[]>(`SELECT ${EXAM_COLUMNS} FROM exams WHERE id = ? LIMIT 1`, [newId]);
   if (!newRows[0]) throw new Error("Failed to duplicate exam.");
   const exam = rowToExam(newRows[0]);
-  const assignments = await fetchCourseAssignments();
-  exam.courseIds = assignments.get(newId) ?? [];
+  exam.courseIds = courseRows.map((row) => row.course_id);
+  return exam;
+  });
+  invalidateExamsCache();
   return exam;
 }
 
 export async function archiveExam(id: string, archived: boolean): Promise<void> {
   await ensureTables();
-  try {
-    await exec(`UPDATE exams SET archived = ? WHERE id = ?`, [archived ? 1 : 0, id]);
-  } catch {
-    // fallback to closed status if column missing
-    await setExamStatus(id, archived ? "closed" : "draft");
-    return;
-  }
-  // Also mirror status for legacy filter: archived exams should be closed; unarchived → draft
-  try {
-    await exec(`UPDATE exams SET status = ? WHERE id = ? AND archived = ?`, [archived ? "closed" : "draft", id, archived ? 1 : 0]);
-  } catch {
-    // ignore
-  }
+  await withTransaction(async (conn) => {
+    await lockExam(conn, id);
+    try {
+      await conn.query(`UPDATE exams SET archived = ?, status = ? WHERE id = ?`, [archived ? 1 : 0, archived ? "closed" : "draft", id]);
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "ER_BAD_FIELD_ERROR") throw error;
+      await conn.query(`UPDATE exams SET status = ? WHERE id = ?`, [archived ? "closed" : "draft", id]);
+    }
+  });
   invalidateExamsCache();
-}
-
-/** Keep exams.question_count / total_marks in sync with linked questions. */
-async function recomputeExamTotals(examId: string | null): Promise<void> {
-  if (!examId) return; // bank-only question — nothing to update
-  try {
-    const totals = await query<{ count: number; marks: string | null }[]>(
-      `SELECT COUNT(*) AS count, SUM(marks) AS marks
-       FROM exam_questions WHERE exam_id = ? AND is_active = 1`,
-      [examId],
-    );
-    await exec(
-      `UPDATE exams SET question_count = ?, total_marks = ? WHERE id = ?`,
-      [
-        totals[0]?.count ?? 0,
-        Number(totals[0]?.marks ?? 0) || 0,
-        examId,
-      ],
-    );
-  } catch {
-    // Best-effort sync.
-  }
 }
 
 // ── Enrollments & Results ────────────────────────────────────────────────

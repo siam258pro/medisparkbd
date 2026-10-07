@@ -86,7 +86,7 @@ function normalizeForCompare(s: string): string {
 function cleanOptionText(raw: string): string {
   let s = raw.trim();
   s = s.replace(/^\*\s*/, "").trim();
-  s = s.replace(/^[\*\-•]+\s*/, "").trim();
+  s = s.replace(/^[\*•]+\s*/, "").replace(/^-\s+/, "").trim();
   s = s.replace(/\s*✓\s*$/g, "").trim();
   s = s.replace(/\s*✔\s*$/g, "").trim();
   s = s.replace(/\s*\(correct\)\s*$/i, "").trim();
@@ -166,6 +166,23 @@ export function strictAnswerIndex(
   if (!Number.isInteger(n)) return null;
   if (n < 0 || n >= optionCount) return null;
   return n;
+}
+
+/** Compact optional blank choices without changing which choice is correct. */
+export function compactMcqOptions(
+  options: string[],
+  correctIndex: unknown,
+): { options: string[]; correctIndex: number | null } {
+  const answer = strictAnswerIndex(correctIndex, options.length);
+  const kept: string[] = [];
+  let remapped: number | null = null;
+  options.forEach((option, index) => {
+    const text = option.trim();
+    if (!text) return;
+    if (index === answer) remapped = kept.length;
+    kept.push(text);
+  });
+  return { options: kept, correctIndex: remapped };
 }
 
 /**
@@ -287,13 +304,13 @@ function parseOptionLine(line: string, allowNumeric = true): { index: number; te
 
   // 1) English A-D with various wrappers
   // (A) text, [A] text, A. text, A) text, A: text, A - text, A। etc.
-  let m = trimmed.match(/^\s*\(\s*([A-Da-d])\s*\)\s*[\.\)\:\-\—।]?\s*(.+)$/);
+  let m = trimmed.match(/^\s*\(\s*([A-Da-d])\s*\)\s*[\.\)\:\—।]?\s*(.+)$/);
   if (m) {
     const idx = m[1].toUpperCase().charCodeAt(0) - 65;
     const ck = checkCorrect(m[2]);
     return { index: idx, text: cleanOptionText(ck.text), isCorrectMarker: ck.isCorrect };
   }
-  m = trimmed.match(/^\s*\[\s*([A-Da-d])\s*\]\s*[\.\)\:\-\—]?\s*(.+)$/);
+  m = trimmed.match(/^\s*\[\s*([A-Da-d])\s*\]\s*[\.\)\:\—]?\s*(.+)$/);
   if (m) {
     const idx = m[1].toUpperCase().charCodeAt(0) - 65;
     const ck = checkCorrect(m[2]);
@@ -307,7 +324,7 @@ function parseOptionLine(line: string, allowNumeric = true): { index: number; te
   }
 
   // 2) Bangla ক খ গ ঘ
-  m = trimmed.match(/^\s*\(\s*([কখগঘ])\s*\)\s*[\.\)\:\-\—।]?\s*(.+)$/);
+  m = trimmed.match(/^\s*\(\s*([কখগঘ])\s*\)\s*[\.\)\:\—।]?\s*(.+)$/);
   if (m) {
     const idx = BN_OPT_MAP[m[1]];
     if (idx !== undefined) {
@@ -315,7 +332,7 @@ function parseOptionLine(line: string, allowNumeric = true): { index: number; te
       return { index: idx, text: cleanOptionText(ck.text), isCorrectMarker: ck.isCorrect };
     }
   }
-  m = trimmed.match(/^\s*\[\s*([কখগঘ])\s*\]\s*[\.\)\:\-\—।]?\s*(.+)$/);
+  m = trimmed.match(/^\s*\[\s*([কখগঘ])\s*\]\s*[\.\)\:\—।]?\s*(.+)$/);
   if (m) {
     const idx = BN_OPT_MAP[m[1]];
     if (idx !== undefined) {
@@ -342,7 +359,7 @@ function parseOptionLine(line: string, allowNumeric = true): { index: number; te
   }
 
   // 3) Roman i-iv / I-IV (option style)
-  m = trimmed.match(/^\s*\(\s*(i{1,3}|iv|I{1,3}|IV)\s*\)\s*[\.\)\:\-\—]?\s*(.+)$/);
+  m = trimmed.match(/^\s*\(\s*(i{1,3}|iv|I{1,3}|IV)\s*\)\s*[\.\)\:\—]?\s*(.+)$/);
   if (m) {
     const idx = romanToIndex(m[1]);
     if (idx !== null) {
@@ -365,7 +382,7 @@ function parseOptionLine(line: string, allowNumeric = true): { index: number; te
 
   // 4) Numeric 1-4 / ১-৪
   if (allowNumeric) {
-    m = trimmed.match(/^\s*\(\s*([1-4]|[১-৪])\s*\)\s*[\.\)\:\-\—।]?\s*(.+)$/);
+    m = trimmed.match(/^\s*\(\s*([1-4]|[১-৪])\s*\)\s*[\.\)\:\—।]?\s*(.+)$/);
     if (m) {
       const ascii = bnDigitsToAscii(m[1]);
       const idx = parseInt(ascii, 10) - 1;
@@ -399,7 +416,7 @@ function optionLabelStyle(line: string): OptionLabelStyle {
 
 /** Numeric/Roman labels are options only when they form an option run, not
  *  when a statement list is followed by an A–D/ক–ঘ option group. */
-function isAmbiguousOptionRun(lines: string[], start: number): boolean {
+function isAmbiguousOptionRun(lines: string[], start: number, statementsBeforeLetters = false): boolean {
   const first = parseOptionLine(lines[start], true);
   if (!first || first.index !== 0) return false;
   const style = optionLabelStyle(lines[start]);
@@ -412,7 +429,7 @@ function isAmbiguousOptionRun(lines: string[], start: number): boolean {
     if (/^(?:Q|Question|প্রশ্ন)/i.test(line) && isQuestionHeaderLine(line)) break;
     const option = parseOptionLine(line, true);
     if (option) {
-      if (optionLabelStyle(line) === "letter") return false;
+      if (optionLabelStyle(line) === "letter") return statementsBeforeLetters && count >= 2;
       if (optionLabelStyle(line) !== style || option.index <= lastIndex) break;
       lastIndex = option.index;
       count++;
@@ -420,7 +437,7 @@ function isAmbiguousOptionRun(lines: string[], start: number): boolean {
       break;
     }
   }
-  return count >= 2;
+  return !statementsBeforeLetters && count >= 2;
 }
 
 // ── mark handling ──────────────────────────────────────────────────────────
@@ -520,35 +537,17 @@ function matchTextToOptionIndex(
 ): number | null {
   const normPayload = normalizeForCompare(text);
   if (!normPayload) return null;
-  // Try exact normalized equality
+  // Substrings (e.g. "globin" or "not Oxygen") are not confident answers.
+  // Require a unique normalized match, allowing comma/space differences in
+  // combination answers such as "1, 2" versus "1,2".
+  const compactPayload = normPayload.replace(/[\s,]+/g, "");
+  const matches: number[] = [];
   for (let i = 0; i < 4; i++) {
-    const opt = options[i] ?? "";
-    if (!opt.trim()) continue;
-    const normOpt = normalizeForCompare(opt);
-    if (normOpt === normPayload) return i;
+    if (!options[i]?.trim()) continue;
+    const normOpt = normalizeForCompare(options[i]);
+    if (normOpt === normPayload || normOpt.replace(/[\s,]+/g, "") === compactPayload) matches.push(i);
   }
-  // Try payload contains option or vice versa (for minor punctuation differences)
-  // Also handle case where payload is like "Urochrome" and option is "Urochrome" with same
-  // Also handle numeric text like "৩টি" vs "৩টি"
-  // For combination options like "1, 2" payload may be "1,2" etc.
-  for (let i = 0; i < 4; i++) {
-    const opt = options[i] ?? "";
-    if (!opt.trim()) continue;
-    const normOpt = normalizeForCompare(opt);
-    // remove commas/spaces for comparison of combination
-    const compactPayload = normPayload.replace(/[\s,]+/g, "");
-    const compactOpt = normOpt.replace(/[\s,]+/g, "");
-    if (compactPayload === compactOpt) return i;
-    // Also check includes
-    if (normPayload.length > 2 && normOpt.length > 2) {
-      if (normOpt.includes(normPayload) || normPayload.includes(normOpt)) {
-        // Prefer longer exact includes; return first match
-        // To avoid false positives for short payload "B" already handled, this is for longer text
-        return i;
-      }
-    }
-  }
-  return null;
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function mapAnswerPayloadToIndex(payload: string, options: [string, string, string, string]): number | null {
@@ -609,23 +608,8 @@ function mapAnswerPayloadToIndex(payload: string, options: [string, string, stri
     }
     if (/^[কখগঘ]$/.test(letter)) return BN_OPT_MAP[letter] ?? null;
   }
-  // Try case where payload is like "B - Urochrome" includes letter and text? Extract letter inside
-  const letterInPayload = clean.match(/(?:^|[^A-Za-z])([A-Da-d])(?:[^A-Za-z]|$)/);
-  if (letterInPayload) {
-    // Only if options matching fails and payload contains single letter surrounded, map to that letter
-    // But ensure not over-matching inside word like "Urochrome" contains "o" not relevant
-    // We'll only use if payload length short (<10) and contains letter.
-    if (clean.length <= 5) {
-      return letterInPayload[1].toUpperCase().charCodeAt(0) - 65;
-    }
-  }
-  // Bangla letter inside payload like "খ" ?
-  const bnInPayload = clean.match(/[কখগঘ]/);
-  if (bnInPayload && clean.length <= 5) {
-    return BN_OPT_MAP[bnInPayload[0]];
-  }
-
-  return null;
+  const namedLabel = clean.match(/^(?:option|অপশন)\s+([A-Da-dকখগঘ])$/i);
+  return namedLabel ? answerLetterToIndex(namedLabel[1]) : null;
 }
 
 // ── answer-key section detection (trailing "Answer Key:" block) ─────────────
@@ -680,22 +664,11 @@ export function answerKeyLabelToIndex(label: string): number | null {
 // Parse "1. B", "2-C", "3: A", "4) D", "Q5: b", "১. খ" etc. from key block text.
 // Multiple entries per line ("1. B 2. C", "1-B, 2-C") are all captured.
 // 4-option only: indices are always 0..3, matching the inline answer path.
+const ANSWER_KEY_ENTRY_RE =
+  /(?:^|[\s,;|।]+)(?:Q(?:uestion)?\s*|প্রশ্ন\s*(?:নং\.?|No\.?)?\s*)?([0-9০-৯]+)(?:\s*[\.\)\]:\-–—=ঃ।]+\s*\(?\s*|[ \t]+(?=[A-Da-dকখগঘ])|(?=[A-Da-dকখগঘ]))([A-Da-d]|[কখগঘ]|[1-4]|[১-৪]|iv|IV|i{1,3}|I{1,3})[ \t]*\)?(?![A-Za-z\u0980-\u09FF0-9])/g;
+
 function parseAnswerKeyEntries(keyText: string): Map<number, string> {
-  const out = new Map<number, string>();
-  if (!keyText.trim()) return out;
-  const re =
-    /(?:^|[\s,;|।]+)(?:Q(?:uestion)?\s*|প্রশ্ন\s*(?:নং\.?|No\.?)?\s*)?(\d+|[০-৯]+)\s*[\.\)\]:\-–—=ঃ।]+\s*\(?\s*([A-Da-d]|[কখগঘ]|[1-4]|[১-৪]|iv|IV|i{1,3}|I{1,3})\s*\)?(?![A-Za-z\u0980-\u09FF0-9])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(keyText)) !== null) {
-    const numAscii = bnDigitsToAscii(m[1]);
-    const qNum = parseInt(numAscii, 10);
-    if (!Number.isFinite(qNum) || qNum <= 0 || qNum > 1000) continue;
-    if (out.has(qNum)) continue; // first entry wins, never guess on duplicates
-    const label = (m[2] ?? "").trim();
-    if (answerKeyLabelToIndex(label) === null) continue;
-    out.set(qNum, label);
-  }
-  return out;
+  return parseStandaloneAnswerKey(keyText).entries;
 }
 
 // ── standalone answer-key detection (separate Answer Key workflow) ──────────
@@ -769,23 +742,12 @@ export function parseStandaloneAnswerKey(rawText: string): StandaloneAnswerKeyRe
   const seenCount = new Map<number, number>();
   const order: number[] = [];
   if (!rawText || !rawText.trim()) return { entries: out, order, duplicates, totalFound: 0 };
-  const keyText = stripStandaloneKeyHeadings(rawText.replace(/\r\n/g, "\n"));
+  const keyText = stripStandaloneKeyHeadings(normalizePasteText(rawText));
   if (!keyText.trim()) return { entries: out, order, duplicates, totalFound: 0 };
 
-  // 1) Explicit separator: "1. A", "2-B", "3: C", "4) D", "Q5: b", "১. খ", "৫। ক"
-  const sepRe =
-    /(?:^|[\s,;|।]+)(?:Q(?:uestion)?\s*|প্রশ্ন\s*(?:নং\.?|No\.?)?\s*)?(\d+|[০-৯]+)\s*[\.\)\]:\-–—=ঃ।]+\s*\(?\s*([A-Da-d]|[কখগঘ]|[1-4]|[১-৪]|iv|IV|i{1,3}|I{1,3})\s*\)?(?![A-Za-z\u0980-\u09FF0-9])/g;
-  // 2) Space-separated: "1 A", "2 b", "10 E" (letters only — numeric ambiguous)
-  const spaceRe =
-    /(?:^|[\s,;|।]+)(?:Q(?:uestion)?\s*)?(\d+|[০-৯]+)\s+([A-Da-d]|[কখগঘ])(?![A-Za-z\u0980-\u09FF0-9])/g;
-  // 3) Concatenated: "1A 2B 3C" (digits immediately followed by letter)
-  const concatRe =
-    /(?:^|[\s,;|।\(\[]+)(?:Q\s*)?(\d{1,4}|[০-৯]{1,4})([A-Da-d]|[কখগঘ])(?![A-Za-z\u0980-\u09FF0-9])/g;
-
-  let totalFound = 0;
-  totalFound += collectKeyMatches(keyText, sepRe, out, duplicates, seenCount);
-  totalFound += collectKeyMatches(keyText, spaceRe, out, duplicates, seenCount);
-  totalFound += collectKeyMatches(keyText, concatRe, out, duplicates, seenCount);
+  // Scan all supported formats together in physical order so the first
+  // duplicate wins regardless of whether it uses spaces, dots or no separator.
+  const totalFound = collectKeyMatches(keyText, ANSWER_KEY_ENTRY_RE, out, duplicates, seenCount);
 
   out.forEach((_v, k) => order.push(k));
   order.sort((a, b) => a - b);
@@ -833,6 +795,10 @@ function splitAnswerKeySection(text: string): {
     const { idx, remainder } = candidates[c];
     const tail = (remainder ? remainder + "\n" : "") + lines.slice(idx + 1).join("\n");
     if (!tail.trim()) continue;
+    // A per-question "Answer:" is also a possible heading. Never cut off
+    // subsequent questions merely because their numeric options resemble keys.
+    const remainderText = stripStandaloneKeyHeadings(tail).replace(ANSWER_KEY_ENTRY_RE, "").replace(/[\s,;|।]+/g, "");
+    if (remainderText) continue;
     const entries = parseAnswerKeyEntries(tail);
     if (entries.size === 0) continue;
     const mainText = lines.slice(0, idx).join("\n").trim();
@@ -846,9 +812,19 @@ function originalHeaderToNumber(header: string | null | undefined): number | nul
   if (!header) return null;
   const ascii = bnDigitsToAscii(header);
   const m = ascii.match(/\d+/);
-  if (!m) return null;
-  const n = parseInt(m[0], 10);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  if (m) {
+    const n = parseInt(m[0], 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  const roman = ascii.trim().replace(/[.)\-]+$/, "").trim().toUpperCase();
+  if (!/^(?=.)M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$/.test(roman)) return null;
+  const values: Record<string, number> = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+  let n = 0;
+  for (let i = 0; i < roman.length; i++) {
+    const value = values[roman[i]];
+    n += value < (values[roman[i + 1]] ?? 0) ? -value : value;
+  }
+  return n > 0 ? n : null;
 }
 
 // Apply trailing answer-key entries to parsed questions by ORIGINAL number.
@@ -1105,13 +1081,6 @@ function parseSingleBlock(blockText: string): ParsedPasteMcq {
   if (answerPayloadRaw !== null) {
     const mapped = mapAnswerPayloadToIndex(answerPayloadRaw, options);
     if (mapped !== null) correctIndex = mapped;
-    else {
-      // If payload was like "Urochrome" but mapping failed due to normalization, keep as needs review
-      // Try alternative: if payload is single char but mapping failed due to punctuation, retry stripped
-      const alt = answerPayloadRaw.replace(/^[^\w\u0980-\u09FF]+|[^\w\u0980-\u09FF]+$/g, "").trim();
-      const mapped2 = mapAnswerPayloadToIndex(alt, options);
-      if (mapped2 !== null) correctIndex = mapped2;
-    }
   }
   if (correctIndex === null && optionMarkerCorrectIdx !== null) correctIndex = optionMarkerCorrectIdx;
 
@@ -1149,7 +1118,7 @@ function parseSingleBlock(blockText: string): ParsedPasteMcq {
 // newlines. Used to force the inline fallback even when statement-guard fires.
 function hasInlineOptionMarkers(blockText: string): boolean {
   const re =
-    /(?:\(?\s*[A-Da-d]\s*\)?\s*[\.\)\:\-\—]\s+|\(?\s*[কখগঘ]\s*\)?\s*[\.\)\:\-।]?\s+|\(?\s*[1-4]\s*\)?\s*[\.\)\:\-]\s+|\(?\s*[১-৪]\s*\)?\s*[\.\)\:\-।]?\s+)/g;
+    /(?:\(?\s*[A-Da-d]\s*\)?\s*[\.\)\:\-\—]\s+|\(?\s*[কখগঘ]\s*\)?\s*[\.\)\:\-।]?\s+|\(?\s*[1-4]\s*\)?\s*[\.\)\:\-]\s+|\(?\s*[১-৪]\s*\)?\s*[\.\)\:\-।]?\s+|\(?\s*(?:iv|i{1,3})\s*\)?\s*[\.\)\:\-]\s+)/gi;
   let count = 0;
   let m: RegExpExecArray | null;
   re.lastIndex = 0;
@@ -1353,7 +1322,7 @@ function splitByNumbering(text: string): string[] | null {
     // still part of the active numeric/Roman option group.
     if (start < 0 && header && lines.slice(0, i).some((l) => l.trim())) return null;
     const separatedHeader = header !== null && !seenOptions && i > start + 1 &&
-      !lines[i - 1].trim() && !isAmbiguousOptionRun(lines, i);
+      !lines[i - 1].trim() && !isAmbiguousOptionRun(lines, i) && !isAmbiguousOptionRun(lines, i, true);
     if (header && (start < 0 || explicitHeader || separatedHeader || ((seenOptions || afterAnswer) && !continuesOptionRun))) {
       if (start >= 0) blocks.push(lines.slice(start, i).join("\n").trim());
       start = i;
