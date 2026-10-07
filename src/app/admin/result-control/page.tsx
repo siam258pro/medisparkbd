@@ -193,7 +193,10 @@ export default function ResultControlPage() {
         </div>
 
         {courseSlug && loading && (
-          <p className="mt-4 text-sm text-slate-500 admin-dark:text-slate-400">Loading result sheet…</p>
+          <p className="mt-4 flex items-center gap-2 text-sm text-slate-500 admin-dark:text-slate-400">
+            <span className="h-5 w-5 animate-spin rounded-full border-2 border-primary-500 border-t-transparent" />
+            Loading result sheet…
+          </p>
         )}
 
         {courseSlug && !loading && sheets !== null && sheets.length === 0 && (
