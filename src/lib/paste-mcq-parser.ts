@@ -923,28 +923,35 @@ function injectNewlinesForInline(text: string): string {
   // Instead of complex lookahead, we scan and insert
   // Simpler: replace occurrences of "  A. " or " A. " with "\nA. " when not at line start via regex with capture
   // Every rule below carries the NOT_IN_ANSWER_LINE guard AFTER its lookahead
-  // (needs the `m` flag so `^` anchors at line starts).
-  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[A-Da-d]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([A-Da-d]\\)\\s*[\\.\\)\\:\\-]?)${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[কখগঘ]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([কখগঘ]\\))${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\[[A-Da-dকখগঘ]\\])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[1-4]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[১-৪]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  // (needs the `m` flag so `^` anchors at line starts, and the `i` flag so
+  // the guard also matches lowercase prefixes like "Correct answer:").
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[A-Da-d]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([A-Da-d]\\)\\s*[\\.\\)\\:\\-]?)${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=[কখগঘ]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\([কখগঘ]\\))${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]+(?=\\[[A-Da-dকখগঘ]\\])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[1-4]\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=[১-৪]\\s*[\\.\\)\\:\\-।])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
   // Roman inline
   s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=(?:i{1,3}|iv)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
-  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=(?:I{1,3}|IV)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gm"), "$1\n");
+  s = s.replace(new RegExp(`([^\\n])[ \\t]{2,}(?=(?:I{1,3}|IV)\\s*[\\.\\)\\:\\-])${NOT_IN_ANSWER_LINE}`, "gim"), "$1\n");
   // Answer inline: handle multi-word prefixes first, then single-word with lookbehind to avoid splitting "Correct Answer" inside
   s = s.replace(/([^\n])[ \t]+(?=(?:Correct\s+Answer|Correct\s+option|সঠিক\s+উত্তর)\s*[:\-=—ঃ.:])/gi, "$1\n");
   s = s.replace(/([^\n])[ \t]+(?<!Correct\s)(?<!সঠিক\s)(?=(?:Ans(?:wer)?\.?|Correct|উত্তর\s*ঃ?)\s*[:\-=—ঃ.:])/gi, "$1\n");
   // Explanation inline: ব্যাখ্যা: / Explanation:
   s = s.replace(/([^\n])[ \t]+(?=(?:ব্যাখ্যা\s*ঃ?|Explanation|Explan\.?)\s*[:\-=—ঃ])/gi, "$1\n");
   // A number inside a stem/header is not a new question. Only split an
-  // inline header after an answer, and never let whitespace span newlines.
+  // inline header after an answer that ALREADY has its payload
+  // ("Answer: B 2. Next…"), and never let whitespace span newlines.
+  // When the answer prefix has no payload yet ("Correct answer: d. …"),
+  // the upcoming label IS the payload — splitting would orphan it and
+  // corrupt both the answer and the options.
   s = s.replace(/[ \t]+(?=(?:Q[ \t]*[.\-]?[ \t]*[0-9০-৯]+[ \t]*[.):\-।]|Question[ \t]*(?:No\.?)?[ \t]*[0-9০-৯]+[ \t]*[.):\-]|প্রশ্ন[ \t]*(?:নং\.?)?[ \t]*[0-9০-৯]+[ \t]*[.):\-।]|[0-9০-৯]+[ \t]*[.)।][ \t]+[^\n]{3,}|[IVXLCDM]+[.)][ \t]+\S))/gi,
     (space, offset: number, source: string) => {
       const prefix = source.slice(source.lastIndexOf("\n", offset - 1) + 1, offset);
-      return /(?:সঠিক\s*উত্তর|উত্তর|Correct\s+Answer|Ans(?:wer)?\.?)\s*[:=ঃ\-]/i.test(prefix) ? "\n" : space;
+      const m = prefix.match(/(?:সঠিক\s*উত্তর|উত্তর|Correct\s+Answer|Ans(?:wer)?\.?)\s*[:=ঃ\-]\s*(.*)$/i);
+      if (!m) return space;
+      return m[1].trim() === "" ? space : "\n";
     });
   } catch {
     return text;
