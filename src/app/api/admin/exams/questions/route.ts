@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
     try {
       const { fetchVariantMap, overlayVariantOntoBase } = await import("@/lib/exam-variants");
       const examId = String(params.get("examId") ?? "");
-      const variants = await fetchVariantMap(examId);
+      const variants = await fetchVariantMap(examId, false, { lang: version, setLabel: set });
       const merged = questions.map((q, index) => {
         if (q.id === null) return { ...q, order: index + 1, hasVariant: false };
         // Corrupt variant options → pure base + hasVariant:false (never mixed).

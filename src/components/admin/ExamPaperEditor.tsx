@@ -112,6 +112,37 @@ function isCompleted(q: ExamQuestion | null | undefined): boolean {
   return true;
 }
 
+/** Content-derived review issues for a slot draft. Fully empty slots report
+ *  nothing — only slots with some content but incomplete data are flagged,
+ *  so "Needs review" survives answer clicks, refreshes and saves instead of
+ *  depending solely on the transient post-detection warnings map. */
+function draftContentIssues(d: SlotDraft | undefined): string[] {
+  if (!d) return [];
+  const hasAny =
+    d.question.trim().length > 0 || d.options.some((o) => o.trim()) || !!d.questionImage;
+  if (!hasAny) return [];
+  const out: string[] = [];
+  if (d.question.trim().length < 3 && !d.questionImage) out.push("Question text missing or too short");
+  if (d.options.filter((o) => o.trim()).length < 2) out.push("At least 2 options required");
+  if (d.correctIndex < 0 || d.correctIndex >= d.options.length || !d.options[d.correctIndex]?.trim()) {
+    out.push("Answer not selected — please verify.");
+  }
+  return out;
+}
+
+/** Parser warnings (post-detection) + live content issues, de-duplicated. */
+function mergedSlotWarnings(stored: string[] | undefined, d: SlotDraft | undefined): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const w of [...(stored ?? []), ...draftContentIssues(d)]) {
+    if (!seen.has(w)) {
+      seen.add(w);
+      out.push(w);
+    }
+  }
+  return out;
+}
+
 function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
@@ -133,6 +164,8 @@ export default function ExamPaperEditor({
   const [busy, setBusy] = useState(false);
   const [detectBusy, setDetectBusy] = useState(false);
   const [saveAllBusy, setSaveAllBusy] = useState(false);
+  /** Determinate save progress (processed/total questions). Null when idle. */
+  const [saveProgress, setSaveProgress] = useState<{ done: number; total: number } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [drafts, setDrafts] = useState<Record<number, SlotDraft>>({});
   // Language Version (Bangla / English) × Set (A / B): four separate
@@ -774,6 +807,7 @@ export default function ExamPaperEditor({
     const confirmedItems: BulkItem[] = [];
     const rejectedNotes: string[] = [];
     setSaveAllBusy(true);
+    setSaveProgress({ done: 0, total: items.length });
     try {
       // One bulk request per 200 items (server batch cap) to existing storage.
       let saved = 0;
@@ -811,6 +845,9 @@ export default function ExamPaperEditor({
         }
         // Object identity also catches switching away and back to the same tab.
         if (workspaceRef.current !== workspace || draftGenerationRef.current !== generation) return;
+        if (saveOperationRef.current === operation) {
+          setSaveProgress({ done: Math.min(start + chunk.length, items.length), total: items.length });
+        }
       }
       void loadCoverage();
       onChanged?.();
@@ -870,6 +907,7 @@ export default function ExamPaperEditor({
       if (saveOperationRef.current === operation) {
         setSavingSlot(null);
         setSaveAllBusy(false);
+        setSaveProgress(null);
       }
     }
   }
@@ -920,15 +958,52 @@ export default function ExamPaperEditor({
     setTimeout(() => setNotice(null), 5000);
   }
 
-  /** Remove one slot: clears its draft and deletes its saved variant cell
-   *  for this version/set (when present). Unsaved-only slots just clear. */
+  /** Remove one slot.
+   *  - Extra detected slots (beyond Total Questions, never saved): the card
+   *    is removed from the list and later extras shift up.
+   *  - Fixed slots (within Total Questions): the position must stay (exam
+   *    config drives the count), so content is cleared instead — saved
+   *    variant cells for this version/set are deleted from the database. */
   async function handleRemoveSlot(slotIndex: number) {
     const slot = slotIndex < displaySlots.length ? displaySlots[slotIndex] : null;
     const q = slot?.q ?? null;
     const savedId = q?.id;
-    const hasSavedVariant = q?.hasVariant === true || ((q?.question?.trim().length ?? 0) >= 3 && savedId !== null && savedId !== undefined);
+    const isExtra = slotIndex >= totalSlots && (savedId === null || savedId === undefined);
+    const hasSavedVariant = !isExtra && (q?.hasVariant === true || ((q?.question?.trim().length ?? 0) >= 3 && savedId !== null && savedId !== undefined));
     if (hasSavedVariant && savedId !== null && savedId !== undefined) {
       if (!window.confirm(`Remove Q${pad(slotIndex + 1)} (including saved)?`)) return;
+    }
+    if (isExtra) {
+      // True removal: drop the draft and compact later extras so the card disappears.
+      const shiftMap = (prev: Record<number, string[]>): Record<number, string[]> => {
+        const next: Record<number, string[]> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          const i = Number(k);
+          if (i < totalSlots || i < slotIndex) next[i] = v;
+          else if (i > slotIndex) next[i - 1] = v;
+        }
+        return next;
+      };
+      setDetectWarnings((prev) => shiftMap(prev));
+      setDetectExistingMap((prev) => {
+        const next: Record<number, boolean> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          const i = Number(k);
+          if (i < totalSlots || i < slotIndex) next[i] = v;
+          else if (i > slotIndex) next[i - 1] = v;
+        }
+        return next;
+      });
+      setDrafts((prev) => {
+        const next: Record<number, SlotDraft> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          const i = Number(k);
+          if (i < totalSlots || i < slotIndex) next[i] = v;
+          else if (i > slotIndex) next[i - 1] = v;
+        }
+        return next;
+      });
+      return;
     }
     setDetectWarnings((prev) => {
       if (!(slotIndex in prev)) return prev;
@@ -1055,15 +1130,12 @@ export default function ExamPaperEditor({
   async function handleCorrectChange(slotIndex: number, newIdx: number) {
     // Draft-only: selecting an answer never writes to the database and never
     // reloads anything. It is saved when "Save Questions" is clicked.
+    // Stored detection warnings are kept — the content-derived "Answer not
+    // selected" issue clears itself on the next render.
     setDrafts((prev) => {
       const cur = prev[slotIndex];
       if (!cur) return prev;
       return { ...prev, [slotIndex]: { ...cur, correctIndex: newIdx } };
-    });
-    setDetectWarnings((prev) => {
-      const next = { ...prev };
-      delete next[slotIndex];
-      return next;
     });
   }
 
@@ -1207,7 +1279,11 @@ export default function ExamPaperEditor({
               className="w-full rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-extrabold text-white shadow hover:bg-emerald-700 disabled:opacity-40 sm:w-auto"
               title="Permanently save all detected/edited questions, answers and images"
             >
-              {saveAllBusy ? "Saving…" : `Save Questions${dirtyCount > 0 ? ` (${dirtyCount} unsaved)` : ""}`}
+              {saveAllBusy && saveProgress
+                ? `Saving… ${saveProgress.done}/${saveProgress.total}`
+                : saveAllBusy
+                  ? "Saving…"
+                  : `Save Questions${dirtyCount > 0 ? ` (${dirtyCount} unsaved)` : ""}`}
             </button>
             <button
               type="button"
@@ -1219,6 +1295,26 @@ export default function ExamPaperEditor({
               Remove All
             </button>
           </div>
+          {saveAllBusy && saveProgress && saveProgress.total > 0 && (
+            <div
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={saveProgress.total}
+              aria-valuenow={saveProgress.done}
+              aria-label="Saving questions"
+              className="space-y-1"
+            >
+              <div className="h-2 w-full overflow-hidden rounded-full bg-emerald-100 admin-dark:bg-emerald-900/40">
+                <div
+                  className="h-full rounded-full bg-emerald-600 transition-[width] duration-300"
+                  style={{ width: `${Math.round((saveProgress.done / saveProgress.total) * 100)}%` }}
+                />
+              </div>
+              <p className="text-[11px] font-bold text-emerald-700 admin-dark:text-emerald-300">
+                Saving… {saveProgress.done}/{saveProgress.total} ({Math.round((saveProgress.done / saveProgress.total) * 100)}%)
+              </p>
+            </div>
+          )}
           <p className="text-[11px] leading-relaxed text-slate-400">
             Detected questions stay unsaved until <span className="font-bold">Save Questions</span> is clicked. Leaving this page without saving discards them.
           </p>
@@ -1432,12 +1528,13 @@ export default function ExamPaperEditor({
               const opts = [...draft.options];
               while (opts.length < 4) opts.push("");
               const isSaving = savingSlot === index;
-              const warnings = detectWarnings[index];
+              const warnings = mergedSlotWarnings(detectWarnings[index], draft);
               const imageUrl = draft.questionImage ?? q?.questionImage ?? null;
 
               return (
                 <li
                   key={q?.id ?? `slot-${index}`}
+                  style={{ contentVisibility: "auto", containIntrinsicSize: "auto 320px" }}
                   className={`rounded-2xl border bg-white p-4 shadow-sm sm:p-5 ${warnings && warnings.length > 0 ? "border-amber-300 admin-dark:border-amber-700" : "border-[#dbeafe] admin-dark:border-[#1e3a65]"} admin-dark:bg-[#112544]`}
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -1457,9 +1554,9 @@ export default function ExamPaperEditor({
                         type="button"
                         onClick={() => void handleRemoveSlot(index)}
                         className="rounded-lg border border-red-200 bg-white px-2 py-0.5 text-[10px] font-bold text-red-600 hover:bg-red-50 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
-                        title={`Remove Q${pad(slotNumber)} from this Version/Set`}
+                        title={index >= totalSlots && (q?.id === null || q?.id === undefined) ? `Remove Q${pad(slotNumber)} from the list` : `Clear Q${pad(slotNumber)} content for this Version/Set`}
                       >
-                        Remove
+                        {index >= totalSlots && (q?.id === null || q?.id === undefined) ? "Remove" : "Clear"}
                       </button>
                     </div>
                   </div>
@@ -1645,12 +1742,13 @@ export default function ExamPaperEditor({
                 const opts = [...draft.options];
                 while (opts.length < 4) opts.push("");
                 const isSaving = savingSlot === index;
-                const warnings = detectWarnings[index];
+                const warnings = mergedSlotWarnings(detectWarnings[index], draft);
                 const imageUrl = draft.questionImage ?? q?.questionImage ?? null;
 
                 return (
                   <li
                     key={q?.id ?? `slot-${index}`}
+                    style={{ contentVisibility: "auto", containIntrinsicSize: "auto 320px" }}
                     className={`rounded-2xl border bg-white p-4 shadow-sm sm:p-5 ${warnings && warnings.length > 0 ? "border-amber-300 admin-dark:border-amber-700" : "border-[#dbeafe] admin-dark:border-[#1e3a65]"} admin-dark:bg-[#112544]`}
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -1670,9 +1768,9 @@ export default function ExamPaperEditor({
                           type="button"
                           onClick={() => void handleRemoveSlot(index)}
                           className="rounded-lg border border-red-200 bg-white px-2 py-0.5 text-[10px] font-bold text-red-600 hover:bg-red-50 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
-                          title={`Remove Q${pad(slotNumber)} from this Version/Set`}
+                          title={index >= totalSlots && (q?.id === null || q?.id === undefined) ? `Remove Q${pad(slotNumber)} from the list` : `Clear Q${pad(slotNumber)} content for this Version/Set`}
                         >
-                          Remove
+                          {index >= totalSlots && (q?.id === null || q?.id === undefined) ? "Remove" : "Clear"}
                         </button>
                       </div>
                     </div>

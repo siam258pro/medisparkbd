@@ -219,17 +219,31 @@ export type VariantRow = {
 export async function fetchVariantMap(
   examId: string,
   strict = false,
+  only?: { lang?: QuestionVersion; setLabel?: QuestionSet },
 ): Promise<Map<string, VariantRow>> {
   const map = new Map<string, VariantRow>();
   try {
     await ensureVariantTables();
+    // Narrow to one workspace when the caller only needs a single
+    // version/set cell per slot (e.g. the admin paper editor) — otherwise
+    // every read pays for all four workspaces' rows.
+    const conds: string[] = [`q.exam_id = ? AND q.is_active = 1`];
+    const params: unknown[] = [examId];
+    if (only?.lang) {
+      conds.push(`v.lang = ?`);
+      params.push(only.lang);
+    }
+    if (only?.setLabel) {
+      conds.push(`v.set_label = ?`);
+      params.push(only.setLabel);
+    }
     const rows = await query<VariantRow[]>(
       `SELECT v.question_id, v.lang, v.set_label, v.question, v.options,
               v.correct_index, v.explanation, v.marks, v.question_image
         FROM exam_question_variants v
         JOIN exam_questions q ON q.id = v.question_id
-       WHERE q.exam_id = ? AND q.is_active = 1`,
-      [examId],
+       WHERE ${conds.join(" AND ")}`,
+      params,
     );
     for (const row of rows) {
       map.set(`${Number(row.question_id)}:${row.lang}:${row.set_label}`, row);
