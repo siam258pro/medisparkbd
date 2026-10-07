@@ -110,14 +110,21 @@ export async function POST(request: NextRequest) {
         );
         if (found[0]) return Number(found[0].id);
         let marksPerSlot = 1;
+        let maxOrder = 0;
         try {
-          const examRows = await query<{ marks_per_question: string | number | null }[]>(
-            `SELECT marks_per_question FROM exams WHERE id = ? LIMIT 1`,
+          const examRows = await query<{ marks_per_question: string | number | null; question_count: string | number | null }[]>(
+            `SELECT marks_per_question, question_count FROM exams WHERE id = ? LIMIT 1`,
             [examId],
           );
           const raw = Number(examRows[0]?.marks_per_question ?? 1);
           if (Number.isFinite(raw) && raw > 0) marksPerSlot = raw;
+          // Never grow beyond the configured Total Questions.
+          const rawCount = Number(examRows[0]?.question_count ?? 0);
+          if (Number.isFinite(rawCount) && rawCount > 0) maxOrder = Math.floor(rawCount);
         } catch {}
+        if (maxOrder > 0 && order > maxOrder) {
+          throw new Error(`Exceeds configured total of ${maxOrder} questions — remove extras or increase Total Questions.`);
+        }
         // Race-safe: concurrent creators may insert the same slot. With a
         // unique key on (exam_id, sort_order) INSERT IGNORE turns the loser
         // into a no-op; without it the catch + re-SELECT still recovers.
@@ -228,12 +235,16 @@ export async function POST(request: NextRequest) {
             };
             // The exam row lock serializes concurrent uploads, so a missing
             // slot is created exactly once without relying on a unique key.
-            const examRows = await run<{ id: string; marks_per_question: string | number | null }[]>(
-              `SELECT id, marks_per_question FROM exams WHERE id = ? FOR UPDATE`, [examId],
+            const examRows = await run<{ id: string; marks_per_question: string | number | null; question_count: string | number | null }[]>(
+              `SELECT id, marks_per_question, question_count FROM exams WHERE id = ? FOR UPDATE`, [examId],
             );
             if (!examRows[0]) throw new BatchRejected("Exam not found.", []);
             const rawMarks = Number(examRows[0].marks_per_question ?? 1);
             const marksPerSlot = Number.isFinite(rawMarks) && rawMarks > 0 ? rawMarks : 1;
+            // Slots must never grow beyond the configured Total Questions —
+            // extra detected rows are rejected instead of auto-created.
+            const rawCount = Number(examRows[0].question_count ?? 0);
+            const maxOrder = Number.isFinite(rawCount) && rawCount > 0 ? Math.floor(rawCount) : 0;
             const slotRows = await run<{ id: number; sort_order: number }[]>(
               `SELECT id, sort_order FROM exam_questions WHERE exam_id = ? ORDER BY sort_order ASC, id ASC FOR UPDATE`, [examId],
             );
@@ -249,6 +260,10 @@ export async function POST(request: NextRequest) {
                 continue;
               }
               if (!questionId) questionId = byOrder.get(entry.order) ?? 0;
+              if (!questionId && maxOrder > 0 && entry.order > maxOrder) {
+                slotErrors.push({ index: entry.idx, error: `Exceeds configured total of ${maxOrder} questions — remove extras or increase Total Questions.` });
+                continue;
+              }
               if (questionId && resolved.has(questionId)) {
                 slotErrors.push({ index: entry.idx, error: "Two questions resolve to the same slot." });
                 continue;

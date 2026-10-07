@@ -320,9 +320,8 @@ export default function ExamPaperEditor({
 
   // Local drafts for inline editing — UNSAVED until "Save Questions" is clicked.
   // Typing, detecting, answering and image uploads only touch these drafts.
-  // Effective total: never truncate pasted detection. If admin pastes 20/50/100,
-  // preview shows all, even if exam was configured for 10. Extra slots are
-  // kept as unsaved drafts and auto-created on Save via resolveOrCreateSlot.
+  // Effective total: never truncate pasted detection for REVIEW, but Save
+  // is capped at totalSlots — slots never grow beyond Total Questions.
   const effectiveTotalSlots = useMemo(() => {
     if (detectionCleared) return 0;
     const draftMax = Object.keys(drafts).length ? Math.max(...Object.keys(drafts).map(Number)) + 1 : 0;
@@ -437,8 +436,8 @@ export default function ExamPaperEditor({
 
       // Detected questions stay UNSAVED drafts until "Save Questions" is clicked.
       // Fully replace drafts — clear ALL old drafts first, then set only the newly detected ones.
-      // Saved images on overwritten slots are preserved in the drafts. All detected are kept,
-      // even beyond configured totalSlots — Save will auto-create slots via resolveOrCreateSlot.
+      // Saved images on overwritten slots are preserved in the drafts. All detected are kept
+      // for review, but only slots within Total Questions can save (extras are blocked).
       const newDrafts: Record<number, SlotDraft> = {};
       for (let i = 0; i < count; i++) {
         const p = useParsed[i];
@@ -458,7 +457,7 @@ export default function ExamPaperEditor({
 
       // No database writes here — the admin reviews and clicks Save Questions.
       let msg = `Detected ${useParsed.length} question${useParsed.length === 1 ? "" : "s"} — filled Q01–Q${pad(count)} in ${detectVersion} Set ${detectSet} (unsaved — review, then click Save Questions).`;
-      if (count > totalSlots) msg += ` Note: ${count} detected exceeds configured ${totalSlots} slots — extra ${count - totalSlots} will auto-create new slots on Save.`;
+      if (count > totalSlots) msg += ` Note: ${count} detected exceeds configured ${totalSlots} slots — extra ${count - totalSlots} will NOT save (slots never grow beyond Total Questions). Remove extras or increase Total Questions first.`;
       const noAnswerCount = useParsed.slice(0, count).filter((p) => p.correctIndex === null).length;
       if (noAnswerCount > 0) msg += ` ${noAnswerCount} question${noAnswerCount === 1 ? "" : "s"} have no confident answer — please verify before saving.`;
       const reviewCount = Object.keys(warnings).length;
@@ -803,6 +802,17 @@ export default function ExamPaperEditor({
           : "Nothing to save — detect or type questions first.",
       );
       return;
+    }
+    // Slots never grow beyond Total Questions — block early with a clear
+    // message instead of letting extras fail mid-save on the server.
+    if (totalSlots > 0) {
+      const over = items.filter((it) => it.order > totalSlots).map((it) => `Q${pad(it.slotIndex + 1)}`);
+      if (over.length > 0) {
+        setError(
+          `Detected ${items.length} exceeds configured ${totalSlots} slots — will not save. Remove extras (${over.join(", ")}) or increase Total Questions, then save again.`,
+        );
+        return;
+      }
     }
     const confirmedItems: BulkItem[] = [];
     const rejectedNotes: string[] = [];
