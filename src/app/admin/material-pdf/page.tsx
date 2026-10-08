@@ -717,19 +717,14 @@ export default function MaterialPdfGeneratorPage() {
     // drops to a single page and the tab stays responsive. Always restored.
     originalDisplays = pageEls.map((el) => el.style.display);
     onProgress?.(0, pageEls.length);
-    for (let i = 0; i < pageEls.length; i++) {
-      const el = pageEls[i];
-      pageEls.forEach((other, j) => {
-        other.style.display = j === i ? "" : "none";
-      });
-      // Settle layout, report progress, then yield so React + browser
-      // actually paint the bar before the heavy capture blocks the thread.
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      onProgress?.(i, pageEls.length);
-      await new Promise((r) => setTimeout(r, 0));
+    // Large builds (e.g. 27 pages): lower capture scale keeps single-page
+    // tasks short enough that the tab never hangs; a failed page retries
+    // once at scale 1 before failing the whole build.
+    const baseScale = pageEls.length > 12 ? 1.25 : 1.5;
+    const captureOne = async (el: HTMLElement, scale: number): Promise<HTMLCanvasElement> => {
       const restoreTextBaseline = fixHtml2CanvasTextBaseline(document);
-      const canvas = await html2canvas(el, {
-        scale: 1.5,
+      return html2canvas(el, {
+        scale,
         useCORS: true,
         allowTaint: false,
         backgroundColor: "#ffffff",
@@ -746,6 +741,24 @@ export default function MaterialPdfGeneratorPage() {
           } catch {}
         },
       }).finally(restoreTextBaseline);
+    };
+    for (let i = 0; i < pageEls.length; i++) {
+      const el = pageEls[i];
+      pageEls.forEach((other, j) => {
+        other.style.display = j === i ? "" : "none";
+      });
+      // Settle layout, report progress, then yield so React + browser
+      // actually paint the bar before the heavy capture blocks the thread.
+      // The longer pause matters for 20+ page builds (hang watchdog).
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      onProgress?.(i, pageEls.length);
+      await new Promise((r) => setTimeout(r, 250));
+      let canvas: HTMLCanvasElement;
+      try {
+        canvas = await captureOne(el, baseScale);
+      } catch {
+        canvas = await captureOne(el, 1);
+      }
       const imgData = canvas.toDataURL("image/jpeg", 0.92);
       const pageW = pdf.internal.pageSize.getWidth();
       const pageH = pdf.internal.pageSize.getHeight();
@@ -2048,6 +2061,7 @@ D. 150 দিন
                 </div>
                 <p className="text-center text-[11px] font-bold text-slate-600 admin-dark:text-slate-300">
                   Building PDF… page {Math.min(buildProgress.done + 1, buildProgress.total)}/{buildProgress.total} ({Math.round((buildProgress.done / buildProgress.total) * 100)}%)
+                  {buildProgress.total > 10 ? " — keep this tab open" : ""}
                 </p>
               </div>
             )}
