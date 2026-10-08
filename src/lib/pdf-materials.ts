@@ -204,6 +204,12 @@ export async function savePdfMaterial(
     issues: q.issues ?? [],
     image: (q as unknown as { image?: unknown }).image ?? null,
     isStandaloneImage: Boolean((q as unknown as { isStandaloneImage?: unknown }).isStandaloneImage),
+    // Topic grouping + original numbering must survive save → load,
+    // otherwise topic cards vanish from reloaded drafts.
+    topic: typeof (q as unknown as { topic?: unknown }).topic === "string"
+      ? ((q as unknown as { topic?: string }).topic ?? undefined)
+      : undefined,
+    originalNumber: ((q as unknown as { originalNumber?: unknown }).originalNumber as string | null | undefined) ?? null,
   })) as PdfMaterialQuestion[];
 
   const payloadJson = JSON.stringify(payload);
