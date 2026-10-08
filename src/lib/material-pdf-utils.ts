@@ -1,19 +1,30 @@
 import type { PdfMaterialQuestion } from "@/lib/pdf-materials";
 
+/** Headings that belong to the answer-key flow, never a topic group. */
+function isAnswerKeyHeadingText(t: string): boolean {
+  return /^(?:answers?\s*(?:key|sheet|list)?|correct\s*answers?|ans(?:wer)?s?\s*key|উত্তর\s*মালা|উত্তরমালা|উত্তরপত্র|উত্তর\s*সমূহ|উত্তরসমূহ|সঠিক\s*উত্তর.*|উত্তর|solution|key)$/i.test(
+    t.trim().replace(/^[:：\-–—\s]+/, "").trim(),
+  );
+}
+
 export function isExplicitTopicHeader(line: string): string | null {
   const t = line.trim();
   if (!t) return null;
+  // A question, option, answer or explanation line is never a topic —
+  // without this, "[A]" option labels, "Unit of …?" questions and
+  // "--- Answer Key ---" separators get swallowed as topic names.
+  if (isQuestionStartLine(t) || isOptionOrAnswerOrStem(t)) return null;
   const topicRe = /^\s*(?:topic|টপিক|বিষয়|বিষয়|অধ্যায়|অধ্যায়|chapter|unit)\s*[:：\-–—]?\s*(.+?)\s*$/i;
   const m1 = t.match(topicRe);
   if (m1 && (m1[1] ?? "").trim()) return (m1[1] ?? "").trim().replace(/^[:：\-–—\s]+/, "").trim();
 
   const bracketRe = /^\s*\[\s*([^\]\n]{1,80})\s*\]\s*$/;
   const m2 = t.match(bracketRe);
-  if (m2 && (m2[1] ?? "").trim()) return (m2[1] ?? "").trim();
+  if (m2 && (m2[1] ?? "").trim() && !isAnswerKeyHeadingText(m2[1])) return (m2[1] ?? "").trim();
 
   const borderRe = /^\s*[-=*~#]{2,}\s*([^-\n=*~#]{2,80})\s*[-=*~#]{2,}\s*$/;
   const m3 = t.match(borderRe);
-  if (m3 && (m3[1] ?? "").trim()) return (m3[1] ?? "").trim();
+  if (m3 && (m3[1] ?? "").trim() && !isAnswerKeyHeadingText(m3[1])) return (m3[1] ?? "").trim();
 
   return null;
 }
@@ -83,12 +94,32 @@ export function splitPasteByTopic(raw: string): { topic: string; text: string }[
         }
       }
       if (nextNonEmpty && isQuestionStartLine(nextNonEmpty)) {
-        if (currentLines.join("\n").trim()) {
-          sections.push({ topic: currentTopic, text: currentLines.join("\n") });
+        // Continuation guard: a short line glued (no blank line) to an
+        // option / answer / explanation / question line is explanatory
+        // text, not a topic label — swallowing it would corrupt the
+        // question and spawn a phantom topic. Blank-separated labels
+        // (or a label at the very start) still become topics.
+        let prevNonEmpty = "";
+        let blankSeparated = true;
+        for (let j = i - 1; j >= 0; j--) {
+          if (lines[j].trim()) {
+            prevNonEmpty = lines[j].trim();
+            blankSeparated = j < i - 1;
+            break;
+          }
         }
-        currentTopic = trimmed;
-        currentLines = [];
-        continue;
+        const continuesContent =
+          !blankSeparated &&
+          !!prevNonEmpty &&
+          (isQuestionStartLine(prevNonEmpty) || isOptionOrAnswerOrStem(prevNonEmpty));
+        if (!continuesContent) {
+          if (currentLines.join("\n").trim()) {
+            sections.push({ topic: currentTopic, text: currentLines.join("\n") });
+          }
+          currentTopic = trimmed;
+          currentLines = [];
+          continue;
+        }
       }
     }
 

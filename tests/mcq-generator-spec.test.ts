@@ -10,6 +10,8 @@ import {
 import {
   splitPasteByTopic,
   sanitizeQuestions,
+  isExplicitTopicHeader,
+  questionsToPasteText,
 } from "../src/lib/material-pdf-utils.ts";
 import { parsePastedMcqs } from "../src/lib/paste-mcq-parser.ts";
 import type { PdfMaterialQuestion } from "../src/lib/pdf-materials.ts";
@@ -306,5 +308,80 @@ describe("Section 27: TEST 7, 8, 9 — MCQ & Topic Reordering & Renumbering", ()
     const afterDelete = sanitizeQuestions(initial.filter((_, idx) => idx !== 2));
     assert.equal(afterDelete.length, 4);
     assert.deepEqual(afterDelete.map((q) => q.qNumber), [1, 2, 3, 4]);
+  });
+});
+
+describe("Section 28: exact detection parity with exam editor", () => {
+  it("never treats [A] option labels, Unit-questions or Answer-Key separators as topics", () => {
+    assert.equal(isExplicitTopicHeader("[A]"), null);
+    assert.equal(isExplicitTopicHeader("Unit of heredity is called?"), null);
+    assert.equal(isExplicitTopicHeader("--- Answer Key ---"), null);
+    assert.equal(isExplicitTopicHeader("Topic: Cell Biology"), "Cell Biology");
+    assert.equal(isExplicitTopicHeader("[Cell Biology]"), "Cell Biology");
+  });
+
+  it("keeps explanation continuations inside the question instead of phantom topics", () => {
+    const raw = `1. What is the powerhouse of the cell?
+A. Nucleus
+B. Mitochondria
+C. Ribosome
+D. Golgi body
+Answer: B
+It produces energy for the cell
+2. What is the outer boundary?
+A. Cell wall
+B. Cell membrane
+C. Capsule
+D. Pellicle
+Answer: B`;
+    const sections = splitPasteByTopic(raw);
+    assert.equal(sections.length, 1);
+    assert.equal(sections[0].topic, "");
+    const parsed = parsePastedMcqs(sections[0].text);
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0].correctIndex, 1);
+    assert.equal(parsed[1].correctIndex, 1);
+  });
+
+  it("keeps blank-separated group labels as topics", () => {
+    const raw = `1. Q1?
+A. 1
+B. 2
+C. 3
+D. 4
+Answer: A
+
+Group B
+
+2. Q2?
+A. 1
+B. 2
+C. 3
+D. 4
+Answer: B`;
+    const sections = splitPasteByTopic(raw);
+    assert.equal(sections.length, 2);
+    assert.equal(sections[1].topic, "Group B");
+    assert.equal(parsePastedMcqs(sections[1].text).length, 1);
+  });
+
+  it("round-trips exam-loaded text exactly (paste -> detect -> same count + answers)", () => {
+    const qs = [
+      createMcq(1, 30, 8, "Cell Biology", "B"),
+      createMcq(2, 30, 8, "Cell Biology", "D"),
+      createMcq(3, 30, 8, "Genetics", "A"),
+    ];
+    const text = questionsToPasteText(sanitizeQuestions(qs));
+    const sections = splitPasteByTopic(text);
+    const got: string[] = [];
+    let total = 0;
+    for (const s of sections) {
+      for (const p of parsePastedMcqs(s.text)) {
+        total += 1;
+        got.push(p.correctIndex === null ? "?" : String.fromCharCode(65 + p.correctIndex));
+      }
+    }
+    assert.equal(total, 3);
+    assert.deepEqual(got, ["B", "D", "A"]);
   });
 });

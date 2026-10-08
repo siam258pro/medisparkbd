@@ -313,7 +313,15 @@ export default function MaterialPdfGeneratorPage() {
     const sections = splitPasteByTopic(pasteText);
     let mapped: PdfMaterialQuestion[] = [];
     for (const section of sections) {
-      const parsed = parsePastedMcqs(section.text);
+      // Same emptiness filter as the exam editor: drop blocks with no
+      // number, no question text and no options so junk never becomes
+      // phantom cards in the A4 preview.
+      const parsed = parsePastedMcqs(section.text).filter(
+        (p) =>
+          p.originalNumber != null ||
+          p.question.trim().length > 0 ||
+          p.options.some((o) => o.trim()),
+      );
       mapped = mapped.concat(mapParserToQuestions(parsed, section.topic));
     }
     if (mapped.length === 0) {
