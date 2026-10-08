@@ -826,10 +826,23 @@ export default function MaterialPdfGeneratorPage() {
   // ── Server drafts (Save as Draft persists, Download removes after success) ──
   type DraftMeta = { id: number; title: string; subject: string | null; questionCount: number; updatedAt: string };
 
+  /** Authorized fetch for drafts: never fires without a minted token, and
+   *  maps auth failures to actionable messages instead of raw "Unauthorized." */
+  const draftFetch = async (path: string, init?: RequestInit): Promise<Response> => {
+    if (!gate.ready) {
+      throw new Error("Checking admin access — please wait a moment and retry.");
+    }
+    const res = await fetch(path, { ...init, headers: { ...(init?.headers as Record<string, string> | undefined), ...authHeaders } });
+    if (res.status === 401 || res.status === 403) {
+      throw new Error("Not authorized — reload the page and sign in again, then retry.");
+    }
+    return res;
+  };
+
   const loadDrafts = async () => {
     setDraftsLoading(true);
     try {
-      const res = await fetch("/api/admin/material-drafts", { cache: "no-store", headers: authHeaders });
+      const res = await draftFetch("/api/admin/material-drafts", { cache: "no-store" });
       const data = (await res.json().catch(() => null)) as { drafts?: DraftMeta[]; error?: string } | null;
       if (!res.ok) throw new Error(data?.error ?? "Failed to load drafts.");
       setDrafts(Array.isArray(data?.drafts) ? data.drafts : []);
@@ -849,9 +862,9 @@ export default function MaterialPdfGeneratorPage() {
   /** Persist the current preview as a server draft (called by Save as Draft). */
   const saveDraftToServer = async (): Promise<number | null> => {
     try {
-      const res = await fetch("/api/admin/material-drafts", {
+      const res = await draftFetch("/api/admin/material-drafts", {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: draftId,
           title: materialName.trim() || "Untitled Material",
@@ -874,7 +887,7 @@ export default function MaterialPdfGeneratorPage() {
   const handleLoadDraft = async (id: number) => {
     setDraftBusy(`load-${id}`);
     try {
-      const res = await fetch(`/api/admin/material-drafts?id=${id}`, { cache: "no-store", headers: authHeaders });
+      const res = await draftFetch(`/api/admin/material-drafts?id=${id}`, { cache: "no-store" });
       const data = (await res.json().catch(() => null)) as {
         draft?: {
           id: number;
@@ -912,9 +925,9 @@ export default function MaterialPdfGeneratorPage() {
     if (!window.confirm("Delete this server draft permanently?")) return;
     setDraftBusy(`delete-${id}`);
     try {
-      const res = await fetch("/api/admin/material-drafts", {
+      const res = await draftFetch("/api/admin/material-drafts", {
         method: "DELETE",
-        headers: { "Content-Type": "application/json", ...authHeaders },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
       });
       const data = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -1002,9 +1015,9 @@ export default function MaterialPdfGeneratorPage() {
       triggerClientDownload(blobToDownload, fileName);
       if (draftId !== null) {
         try {
-          const res = await fetch("/api/admin/material-drafts", {
+          const res = await draftFetch("/api/admin/material-drafts", {
             method: "DELETE",
-            headers: { "Content-Type": "application/json", ...authHeaders },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ id: draftId }),
           });
           if (!res.ok) throw new Error("Server removal failed.");
@@ -1219,7 +1232,7 @@ export default function MaterialPdfGeneratorPage() {
             <button
               type="button"
               onClick={() => void loadDrafts()}
-              disabled={draftsLoading}
+              disabled={draftsLoading || !gate.ready}
               className="rounded-xl border border-[#cbd5e1] bg-white px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
             >
               {draftsLoading ? "Loading…" : "↻ Refresh"}
@@ -1248,7 +1261,7 @@ export default function MaterialPdfGeneratorPage() {
                   <button
                     type="button"
                     onClick={() => void handleLoadDraft(d.id)}
-                    disabled={draftBusy !== null}
+                    disabled={draftBusy !== null || !gate.ready}
                     className="rounded-lg bg-[#0b1e3a] px-3 py-1 text-[11px] font-bold text-white hover:bg-[#123060] disabled:opacity-40 admin-dark:bg-[#234e9f]"
                   >
                     {draftBusy === `load-${d.id}` ? "Loading…" : "Load"}
@@ -1256,7 +1269,7 @@ export default function MaterialPdfGeneratorPage() {
                   <button
                     type="button"
                     onClick={() => void handleDeleteDraft(d.id)}
-                    disabled={draftBusy !== null}
+                    disabled={draftBusy !== null || !gate.ready}
                     className="rounded-lg border border-red-200 bg-white px-3 py-1 text-[11px] font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
                   >
                     {draftBusy === `delete-${d.id}` ? "Deleting…" : "Delete"}
@@ -2049,17 +2062,17 @@ D. 150 দিন
             <div className="mt-6 flex flex-wrap justify-center gap-3">
               <button
                 onClick={handleSaveDraft}
-                disabled={generating || draftSaving}
+                disabled={generating || draftSaving || !gate.ready}
                 className="rounded-xl bg-[#0b1e3a] px-8 py-3 text-sm font-extrabold text-white shadow hover:bg-[#123060] disabled:opacity-40 admin-dark:bg-[#234e9f]"
-                title={draftSaving ? "Saving draft…" : draftId !== null ? `Update server draft #${draftId}` : "Save as Draft on the server (editable later)"}
+                title={!gate.ready ? "Checking admin access…" : draftSaving ? "Saving draft…" : draftId !== null ? `Update server draft #${draftId}` : "Save as Draft on the server (editable later)"}
               >
                 {draftSaving ? "Saving Draft…" : draftId !== null ? `Update Draft #${draftId}` : "Save as Draft"}
               </button>
               <button
                 onClick={handleDownloadPdf}
-                disabled={generating || draftSaving}
+                disabled={generating || draftSaving || !gate.ready}
                 className="rounded-xl border border-[#cbd5e1] bg-white px-6 py-3 text-sm font-bold text-[#0b1e3a] hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
-                title={generating ? "Building PDF…" : "Download PDF to your device (removes the server draft after success)"}
+                title={generating ? "Building PDF…" : !gate.ready ? "Checking admin access…" : "Download PDF to your device (removes the server draft after success)"}
               >
                 {generating && buildProgress && buildProgress.total > 0
                   ? `Building ${Math.round((buildProgress.done / buildProgress.total) * 100)}%`
@@ -2070,7 +2083,7 @@ D. 150 দিন
               {draftId !== null && (
                 <button
                   onClick={() => void handleDeleteDraft(draftId)}
-                  disabled={generating || draftSaving || draftBusy !== null}
+                  disabled={generating || draftSaving || draftBusy !== null || !gate.ready}
                   className="rounded-xl border border-red-200 bg-white px-6 py-3 text-sm font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300 admin-dark:hover:bg-red-500/10"
                   title={`Delete server draft #${draftId} permanently (local preview stays)`}
                 >
