@@ -678,7 +678,9 @@ export default function MaterialPdfGeneratorPage() {
 
   // Shared core: build PDF Blob client-side (no server round-trip).
   // Reports per-page progress so the Download button shows live %.
-  // Yields between pages so React paints the bar instead of hanging.
+  // Each page is captured in isolation (siblings hidden) at 1.5x scale —
+  // a full-document 2x capture is a single minutes-long task that freezes
+  // the tab ("Page isn't responding"). Yields between pages let the bar paint.
   const buildPdfBlob = async (onProgress?: (done: number, total: number) => void): Promise<Blob> => {
     if (questions.length === 0) throw new Error("No questions to generate.");
     if (!previewRef.current) throw new Error("Preview not ready — please try again.");
@@ -707,17 +709,25 @@ export default function MaterialPdfGeneratorPage() {
     );
     await new Promise((r) => setTimeout(r, 300));
     const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-    const pageEls = previewRef.current.querySelectorAll<HTMLElement>(".a4-page");
+    const pageEls = Array.from(previewRef.current.querySelectorAll<HTMLElement>(".a4-page"));
     if (!pageEls || pageEls.length === 0) throw new Error("Preview not ready");
+    // Capture one page at a time with the rest hidden: layout/paint cost
+    // drops to a single page and the tab stays responsive. Always restored.
+    const originalDisplays = pageEls.map((el) => el.style.display);
     onProgress?.(0, pageEls.length);
     for (let i = 0; i < pageEls.length; i++) {
       const el = pageEls[i];
-      // Let the browser paint (progress bar) before the next heavy capture.
-      await new Promise((r) => setTimeout(r, 0));
+      pageEls.forEach((other, j) => {
+        other.style.display = j === i ? "" : "none";
+      });
+      // Settle layout, report progress, then yield so React + browser
+      // actually paint the bar before the heavy capture blocks the thread.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       onProgress?.(i, pageEls.length);
+      await new Promise((r) => setTimeout(r, 0));
       const restoreTextBaseline = fixHtml2CanvasTextBaseline(document);
       const canvas = await html2canvas(el, {
-        scale: 2,
+        scale: 1.5,
         useCORS: true,
         allowTaint: false,
         backgroundColor: "#ffffff",
@@ -748,6 +758,12 @@ export default function MaterialPdfGeneratorPage() {
     if (!blob || blob.size === 0) throw new Error("Generated PDF is empty — please try again.");
     return blob;
     } finally {
+      // Always unhide pages (even on failure) so the preview is intact.
+      try {
+        pageEls.forEach((el, j) => {
+          el.style.display = originalDisplays[j] ?? "";
+        });
+      } catch {}
       setCaptureClean(false);
     }
   };
