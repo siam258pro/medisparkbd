@@ -85,6 +85,11 @@ export default function MaterialPdfGeneratorPage() {
   const [questions, setQuestions] = useState<PdfMaterialQuestion[]>([]);
   const [lineSpacing, setLineSpacing] = useState<LineSpacing>("normal");
   const [detection, setDetection] = useState<{ total: number } | null>(null);
+  // Server draft (Generate PDF saves; Download PDF removes after success).
+  const [draftId, setDraftId] = useState<number | null>(null);
+  const [drafts, setDrafts] = useState<{ id: number; title: string; subject: string | null; questionCount: number; updatedAt: string }[]>([]);
+  const [draftsLoading, setDraftsLoading] = useState(false);
+  const [draftBusy, setDraftBusy] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
@@ -348,6 +353,8 @@ export default function MaterialPdfGeneratorPage() {
       setToast("This exam has no usable questions.");
       return;
     }
+    // Exam content starts a fresh local session (not linked to a server draft).
+    setDraftId(null);
     if (loadMode === "append" && questions.length > 0) {
       const merged = sanitizeQuestions([...questions, ...loaded]);
       setQuestions(merged);
@@ -759,6 +766,112 @@ export default function MaterialPdfGeneratorPage() {
     }
   };
 
+  // ── Server drafts (Generate saves, Download removes after success) ──
+  type DraftMeta = { id: number; title: string; subject: string | null; questionCount: number; updatedAt: string };
+
+  const loadDrafts = async () => {
+    setDraftsLoading(true);
+    try {
+      const res = await fetch("/api/admin/material-drafts", { cache: "no-store", headers: authHeaders });
+      const data = (await res.json().catch(() => null)) as { drafts?: DraftMeta[]; error?: string } | null;
+      if (!res.ok) throw new Error(data?.error ?? "Failed to load drafts.");
+      setDrafts(Array.isArray(data?.drafts) ? data.drafts : []);
+    } catch {
+      // Draft list is best-effort — local editing still works.
+    } finally {
+      setDraftsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (mode === "mcq" && gate.ready) void loadDrafts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, gate.ready]);
+
+  /** Persist the current preview as a server draft (called by Generate PDF). */
+  const saveDraftToServer = async (): Promise<number | null> => {
+    try {
+      const res = await fetch("/api/admin/material-drafts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({
+          id: draftId,
+          title: materialName.trim() || "Untitled Material",
+          subtitle,
+          lineSpacing,
+          questions,
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as { id?: number; error?: string } | null;
+      if (!res.ok || !data?.id) throw new Error(data?.error ?? "Draft save failed.");
+      setDraftId(data.id);
+      void loadDrafts();
+      return data.id;
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : "Draft save failed.");
+      return null;
+    }
+  };
+
+  const handleLoadDraft = async (id: number) => {
+    setDraftBusy(`load-${id}`);
+    try {
+      const res = await fetch(`/api/admin/material-drafts?id=${id}`, { cache: "no-store", headers: authHeaders });
+      const data = (await res.json().catch(() => null)) as {
+        draft?: {
+          id: number;
+          title: string;
+          subject: string | null;
+          payload?: { header?: { title?: string; subject?: string }; questions?: PdfMaterialQuestion[]; lineSpacing?: unknown };
+        };
+        error?: string;
+      } | null;
+      if (!res.ok || !data?.draft) throw new Error(data?.error ?? "Failed to load draft.");
+      const loaded = sanitizeQuestions(Array.isArray(data.draft.payload?.questions) ? data.draft.payload.questions : []);
+      if (loaded.length === 0) throw new Error("Draft has no questions.");
+      const header = data.draft.payload?.header;
+      const ls = data.draft.payload?.lineSpacing;
+      setQuestions(loaded);
+      setPasteText(questionsToPasteText(loaded));
+      setMaterialName(header?.title?.trim() || data.draft.title || "");
+      setSubtitle(header?.subject ?? data.draft.subject ?? "MCQ Practice Material");
+      if (ls === "compact" || ls === "normal" || ls === "relaxed" || typeof ls === "number") setLineSpacing(ls);
+      setDraftId(data.draft.id);
+      setDetection({ total: loaded.filter((q) => !q.isStandaloneImage).length });
+      setPdfReady(false);
+      setPdfBlob(null);
+      setGenerateError(null);
+      setToast(`Draft "${data.draft.title}" loaded — edit, Generate again to update it.`);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : "Failed to load draft.");
+    } finally {
+      setDraftBusy(null);
+    }
+  };
+
+  const handleDeleteDraft = async (id: number) => {
+    if (!window.confirm("Delete this server draft permanently?")) return;
+    setDraftBusy(`delete-${id}`);
+    try {
+      const res = await fetch("/api/admin/material-drafts", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({ id }),
+      });
+      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) throw new Error(data?.error ?? "Delete failed.");
+      if (draftId === id) setDraftId(null);
+      setDrafts((prev) => prev.filter((d) => d.id !== id));
+      setToast("Draft deleted from server.");
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : "Delete failed.");
+    } finally {
+      setDraftBusy(null);
+    }
+  };
+
   const handleGeneratePdf = async () => {
     if (questions.length === 0) {
       setToast("No questions to generate.");
@@ -786,7 +899,14 @@ export default function MaterialPdfGeneratorPage() {
       setPdfUrl(url);
       pdfUrlRef.current = url;
       setPdfReady(true);
-      setToast("PDF generated — click Download PDF");
+      // Generate = preview + server draft (editable later). A failed draft
+      // save never fails the preview — the blob is already valid.
+      const savedId = await saveDraftToServer();
+      setToast(
+        savedId
+          ? `PDF generated + draft #${savedId} saved on server — edit anytime, Download removes it.`
+          : "PDF generated — click Download PDF",
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : "PDF generation failed — please try again.";
       setGenerateError(msg);
@@ -802,43 +922,37 @@ export default function MaterialPdfGeneratorPage() {
       setToast("Please wait — generating PDF…");
       return;
     }
+    // Separate function from Generate: Download never builds the PDF, it
+    // only ships the generated blob — Generate PDF must come first.
+    if (!pdfBlob || !pdfReady) {
+      setToast("Click Generate PDF first, then Download.");
+      return;
+    }
     try {
       const fileName = `${sanitizeFileName(materialName)}.pdf`;
-      // If already generated, download the stored blob immediately (client-side)
-      let blobToDownload: Blob | null = pdfBlob;
-      // Also try ref in case state not yet flushed (ultra-fast click after Generate)
-      if (!blobToDownload && pdfUrlRef.current && pdfBlob) blobToDownload = pdfBlob;
-      // If no blob yet, auto-generate first then download — single click generates + downloads to device
-      if (!blobToDownload || !pdfReady) {
-        setGenerating(true);
-        setGenerateError(null);
-        if (pdfUrl) {
-          URL.revokeObjectURL(pdfUrl);
-          pdfUrlRef.current = null;
-        }
-        setPdfUrl(null);
-        setPdfBlob(null);
+      triggerClientDownload(pdfBlob, fileName);
+      // Download dispatched without errors → remove the server draft so it
+      // can't be downloaded twice. ANY failure above keeps the draft.
+      if (draftId !== null) {
         try {
-          blobToDownload = await buildPdfBlob();
-          const url = URL.createObjectURL(blobToDownload);
-          setPdfBlob(blobToDownload);
-          setPdfUrl(url);
-          pdfUrlRef.current = url;
-          setPdfReady(true);
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : "PDF generation failed — please try again.";
-          setGenerateError(msg);
-          setToast(msg);
-          return;
-        } finally {
-          setGenerating(false);
+          const res = await fetch("/api/admin/material-drafts", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json", ...authHeaders },
+            body: JSON.stringify({ id: draftId }),
+          });
+          if (!res.ok) throw new Error("Server removal failed.");
+          setDraftId(null);
+          void loadDrafts();
+          setToast(`PDF downloaded — server draft #${draftId} removed.`);
+        } catch {
+          setToast("PDF downloaded — but the server draft could not be removed. Delete it manually below.");
         }
+      } else {
+        setToast("PDF downloaded to your device");
       }
-      if (!blobToDownload) throw new Error("No PDF to download — please click Generate PDF first.");
-      triggerClientDownload(blobToDownload, fileName);
-      setToast("PDF downloaded to your device");
       setGenerateError(null);
     } catch (e) {
+      // Download failed → server draft stays untouched for a retry.
       const msg = e instanceof Error ? e.message : "Download failed — please try again.";
       setGenerateError(msg);
       setToast(msg);
@@ -874,6 +988,7 @@ export default function MaterialPdfGeneratorPage() {
     setQuestions([]);
     setPasteText("");
     setDetection(null);
+    setDraftId(null);
     setGenerateError(null);
     setPdfReady(false);
     setPdfBlob(null);
@@ -1021,6 +1136,68 @@ export default function MaterialPdfGeneratorPage() {
               <p className="text-xs text-slate-400">Checking admin access…</p>
             )}
           </div>
+        </div>
+
+        {/* 2b. Server Drafts — Generate saves here, edit later, Download removes */}
+        <div className="mt-6 rounded-2xl border border-[#dbeafe] bg-white p-4 sm:p-6 shadow-sm admin-dark:border-[#1e3a65] admin-dark:bg-[#112544]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label className="text-sm font-extrabold text-[#0b1e3a] admin-dark:text-white">
+              Saved Drafts
+              {draftId !== null && (
+                <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-extrabold text-emerald-700 admin-dark:bg-emerald-900/30 admin-dark:text-emerald-300">
+                  Editing draft #{draftId}
+                </span>
+              )}
+            </label>
+            <button
+              type="button"
+              onClick={() => void loadDrafts()}
+              disabled={draftsLoading}
+              className="rounded-xl border border-[#cbd5e1] bg-white px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
+            >
+              {draftsLoading ? "Loading…" : "↻ Refresh"}
+            </button>
+          </div>
+          <p className="mt-1 text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
+            Generate PDF saves a draft on the server — load it later to paste more questions, remove any, and Generate again. Downloading removes the draft only after a successful download.
+          </p>
+          {draftsLoading && drafts.length === 0 ? (
+            <p className="mt-3 text-xs text-slate-400">Loading drafts…</p>
+          ) : drafts.length === 0 ? (
+            <p className="mt-3 text-xs text-slate-400">No saved drafts yet — Generate PDF to create one.</p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {drafts.map((d) => (
+                <li
+                  key={d.id}
+                  className={`flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2 ${d.id === draftId ? "border-emerald-400 bg-emerald-50/60 admin-dark:border-emerald-700 admin-dark:bg-emerald-900/20" : "border-[#e2e8f0] bg-[#f8fafc] admin-dark:border-[#1e3a65] admin-dark:bg-[#0a162e]"}`}
+                >
+                  <span className="min-w-0 flex-1 text-xs font-bold text-[#0b1e3a] admin-dark:text-white">
+                    #{d.id} {d.title}
+                    <span className="ml-2 font-semibold text-slate-500 admin-dark:text-slate-400">
+                      {d.questionCount} Qs • {new Date(d.updatedAt).toLocaleString()}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleLoadDraft(d.id)}
+                    disabled={draftBusy !== null}
+                    className="rounded-lg bg-[#0b1e3a] px-3 py-1 text-[11px] font-bold text-white hover:bg-[#123060] disabled:opacity-40 admin-dark:bg-[#234e9f]"
+                  >
+                    {draftBusy === `load-${d.id}` ? "Loading…" : "Load"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteDraft(d.id)}
+                    disabled={draftBusy !== null}
+                    className="rounded-lg border border-red-200 bg-white px-3 py-1 text-[11px] font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300"
+                  >
+                    {draftBusy === `delete-${d.id}` ? "Deleting…" : "Delete"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         {/* 4. Watermark Logo */}
@@ -1807,18 +1984,19 @@ D. 150 দিন
                 onClick={handleDownloadPdf}
                 disabled={generating}
                 className="rounded-xl border border-[#cbd5e1] bg-white px-6 py-3 text-sm font-bold text-[#0b1e3a] hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
-                title={generating ? "Generating PDF…" : pdfReady ? "Download PDF to your device" : "Download PDF (auto-generates if needed) — saves to your device"}
+                title={generating ? "Generating PDF…" : pdfReady ? "Download PDF to your device (removes the server draft)" : "Generate PDF first, then Download"}
               >
                 {generating ? "Preparing…" : "Download PDF"}
               </button>
             </div>
             {pdfReady && !generating ? (
               <p className="mt-2 text-center text-xs font-semibold text-emerald-700 admin-dark:text-emerald-300">
-                ✓ PDF ready — click Download PDF to save {sanitizeFileName(materialName)}.pdf to your device
+                ✓ PDF ready{draftId !== null ? ` + draft #${draftId} saved on server` : ""} — click Download PDF to save {sanitizeFileName(materialName)}.pdf to your device
+                {draftId !== null ? " (the server draft is removed after a successful download)" : ""}
               </p>
             ) : !pdfReady && !generating && questions.length > 0 ? (
               <p className="mt-2 text-center text-xs text-slate-500 admin-dark:text-[#8da0c0]">
-                Tip: Download PDF auto-generates first if needed — file saves directly to your device (not server)
+                Tip: Generate PDF saves a server draft (editable later) — Download only ships the file and removes the draft
               </p>
             ) : null}
           </>
