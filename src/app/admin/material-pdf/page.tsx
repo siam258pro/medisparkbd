@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo, useRef, Fragment } from "react";
+import { useEffect, useState, useMemo, useRef, useCallback, Fragment } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { AccessLoading } from "@/components/auth/AccessGuard";
 import { parsePastedMcqs } from "@/lib/paste-mcq-parser";
@@ -17,8 +17,6 @@ import CqPdfGenerator from "@/components/admin/MaterialPdf/CqPdfGenerator";
 import ExamSourcePicker from "@/components/admin/MaterialPdf/ExamSourcePicker";
 import { capturePageRect, fixHtml2CanvasTextBaseline, sanitizeClonedColorsForHtml2Canvas } from "@/components/admin/MaterialPdf/pdf-capture";
 import { useAdminGate } from "@/components/admin/admin-ui";
-
-type Step = "paste" | "preview";
 
 /** Main generator selection — exactly TWO cards, never a third "setup" card. */
 type GeneratorMode = "select" | "mcq" | "cq";
@@ -85,12 +83,13 @@ export default function MaterialPdfGeneratorPage() {
   const [questions, setQuestions] = useState<PdfMaterialQuestion[]>([]);
   const [lineSpacing, setLineSpacing] = useState<LineSpacing>("normal");
   const [detection, setDetection] = useState<{ total: number } | null>(null);
-  // Server draft (Generate PDF saves; Download PDF removes after success).
+  // Server draft (Save as Draft persists; Download PDF removes after success).
   const [draftId, setDraftId] = useState<number | null>(null);
   const [drafts, setDrafts] = useState<{ id: number; title: string; subject: string | null; questionCount: number; updatedAt: string }[]>([]);
   const [draftsLoading, setDraftsLoading] = useState(false);
   const [draftBusy, setDraftBusy] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [draftSaving, setDraftSaving] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
@@ -119,51 +118,44 @@ export default function MaterialPdfGeneratorPage() {
   // True while html2canvas captures — scaling is suspended so the PDF stays full-res.
   const [captureClean, setCaptureClean] = useState(false);
   const pageHeightRefs = useRef<Map<number, number>>(new Map());
-  const [, setPageHeightsTick] = useState(0);
+  const [pageHeights, setPageHeights] = useState<Record<number, number>>({});
 
-  const recordPageHeight = (pageNumber: number, el: HTMLElement | null) => {
+  const recordPageHeight = useCallback((pageNumber: number, el: HTMLElement | null) => {
     if (!el) {
-      if (pageHeightRefs.current.delete(pageNumber)) setPageHeightsTick((t) => t + 1);
+      if (pageHeightRefs.current.delete(pageNumber)) {
+        setPageHeights((prev) => {
+          if (!(pageNumber in prev)) return prev;
+          const next = { ...prev };
+          delete next[pageNumber];
+          return next;
+        });
+      }
       return;
     }
     const h = el.offsetHeight;
     if (h > 0 && pageHeightRefs.current.get(pageNumber) !== h) {
       pageHeightRefs.current.set(pageNumber, h);
-      setPageHeightsTick((t) => t + 1);
+      setPageHeights((prev) => (prev[pageNumber] === h ? prev : { ...prev, [pageNumber]: h }));
     }
-  };
-
-  // Stable per-page callback refs. An inline `ref={(el) => ...}` creates a NEW
-  // function every render, so React detaches (null) + re-attaches on EVERY
-  // render — each path calls setPageHeightsTick → rerender → new ref →
-  // infinite loop (React error #185, triggered on Exam Load when the preview
-  // mounts). Cached callbacks keep ref identity stable across renders.
-  const pageRefCallbacks = useRef(new Map<number, (el: HTMLElement | null) => void>());
-  const getPageRef = (pageNumber: number) => {
-    let cb = pageRefCallbacks.current.get(pageNumber);
-    if (!cb) {
-      cb = (el: HTMLElement | null) => recordPageHeight(pageNumber, el);
-      pageRefCallbacks.current.set(pageNumber, cb);
-    }
-    return cb;
-  };
+  }, []);
 
   // Stable per-question file-input callbacks — same pattern as getPageRef.
   // The previous inline `ref={(el) => ...}` recreated the closure every render,
   // forcing React to detach/re-attach every question's hidden input on each
   // keystroke (edit lag that grows with question count).
-  const questionFileRefCallbacks = useRef(new Map<string, (el: HTMLInputElement | null) => void>());
-  const getQuestionFileRef = (id: string) => {
-    let cb = questionFileRefCallbacks.current.get(id);
-    if (!cb) {
-      cb = (el: HTMLInputElement | null) => {
-        if (el) questionFileRefs.current.set(id, el);
-        else questionFileRefs.current.delete(id);
-      };
-      questionFileRefCallbacks.current.set(id, cb);
-    }
-    return cb;
-  };
+  const questionFileRefCallbacks = useMemo(
+    () =>
+      new Map(
+        questions.map((question) => [
+          question.id,
+          (el: HTMLInputElement | null) => {
+            if (el) questionFileRefs.current.set(question.id, el);
+            else questionFileRefs.current.delete(question.id);
+          },
+        ]),
+      ),
+    [questions],
+  );
 
   function sanitizeFileName(name: string): string {
     const raw = (name || "MediSpark-Material").trim();
@@ -257,22 +249,30 @@ export default function MaterialPdfGeneratorPage() {
       titleReserve: materialName.trim().length > 0,
     });
   }, [questions, lineSpacing, materialName]);
+  // Stable per-page callback refs. Reusing these callbacks prevents React from
+  // detaching and re-attaching every page ref on each editor keystroke.
+  const pageRefCallbacks = useMemo(
+    () =>
+      new Map(
+        pages.map((page) => [
+          page.pageNumber,
+          (el: HTMLElement | null) => recordPageHeight(page.pageNumber, el),
+        ]),
+      ),
+    [pages, recordPageHeight],
+  );
   const [paginateDebugOn, setPaginateDebugOn] = useState(false);
 
   // Prune cached ref callbacks + measured heights for pages/questions that no
   // longer exist (delete/move/edit shrinks the maps instead of leaking them).
   useEffect(() => {
     const livePages = new Set(pages.map((p) => p.pageNumber));
-    for (const k of [...pageRefCallbacks.current.keys()]) {
-      if (!livePages.has(k)) pageRefCallbacks.current.delete(k);
-    }
     for (const k of [...pageHeightRefs.current.keys()]) {
       if (!livePages.has(k)) pageHeightRefs.current.delete(k);
     }
     const liveIds = new Set(questions.map((q) => q.id));
-    for (const k of [...questionFileRefCallbacks.current.keys()]) {
+    for (const k of [...questionFileRefs.current.keys()]) {
       if (!liveIds.has(k)) {
-        questionFileRefCallbacks.current.delete(k);
         questionFileRefs.current.delete(k);
       }
     }
@@ -374,7 +374,7 @@ export default function MaterialPdfGeneratorPage() {
       setDetection({ total: loaded.filter((q) => !q.isStandaloneImage).length });
       setPasteText(questionsToPasteText(loaded));
       if (examTitle.trim()) setMaterialName(examTitle.trim());
-      setToast(`${loaded.length} questions loaded from "${examTitle}" — edit & Generate PDF`);
+      setToast(`${loaded.length} questions loaded from "${examTitle}" — edit, Save as Draft, then Download`);
     }
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -711,7 +711,7 @@ export default function MaterialPdfGeneratorPage() {
       const canvas = await html2canvas(el, {
         scale: 2,
         useCORS: true,
-        allowTaint: true,
+        allowTaint: false,
         backgroundColor: "#ffffff",
         logging: false,
         onclone: (clonedDoc) => {
@@ -766,7 +766,7 @@ export default function MaterialPdfGeneratorPage() {
     }
   };
 
-  // ── Server drafts (Generate saves, Download removes after success) ──
+  // ── Server drafts (Save as Draft persists, Download removes after success) ──
   type DraftMeta = { id: number; title: string; subject: string | null; questionCount: number; updatedAt: string };
 
   const loadDrafts = async () => {
@@ -789,7 +789,7 @@ export default function MaterialPdfGeneratorPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, gate.ready]);
 
-  /** Persist the current preview as a server draft (called by Generate PDF). */
+  /** Persist the current preview as a server draft (called by Save as Draft). */
   const saveDraftToServer = async (): Promise<number | null> => {
     try {
       const res = await fetch("/api/admin/material-drafts", {
@@ -842,7 +842,7 @@ export default function MaterialPdfGeneratorPage() {
       setPdfReady(false);
       setPdfBlob(null);
       setGenerateError(null);
-      setToast(`Draft "${data.draft.title}" loaded — edit, Generate again to update it.`);
+      setToast(`Draft "${data.draft.title}" loaded — edit, Save as Draft again to update it.`);
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e) {
       setToast(e instanceof Error ? e.message : "Failed to load draft.");
@@ -872,67 +872,64 @@ export default function MaterialPdfGeneratorPage() {
     }
   };
 
-  const handleGeneratePdf = async () => {
+  const handleSaveDraft = async () => {
     if (questions.length === 0) {
-      setToast("No questions to generate.");
-      setGenerateError("No questions to generate.");
+      setToast("No questions to save.");
+      setGenerateError("No questions to save.");
       return;
     }
-    if (!previewRef.current) {
-      setToast("Preview not ready");
-      setGenerateError("Preview not ready — please try again.");
-      return;
-    }
-    setGenerating(true);
+    setDraftSaving(true);
     setGenerateError(null);
-    setPdfReady(false);
-    if (pdfUrl) {
-      URL.revokeObjectURL(pdfUrl);
-      pdfUrlRef.current = null;
-    }
-    setPdfUrl(null);
-    setPdfBlob(null);
     try {
-      const blob = await buildPdfBlob();
-      const url = URL.createObjectURL(blob);
-      setPdfBlob(blob);
-      setPdfUrl(url);
-      pdfUrlRef.current = url;
-      setPdfReady(true);
-      // Generate = preview + server draft (editable later). A failed draft
-      // save never fails the preview — the blob is already valid.
       const savedId = await saveDraftToServer();
-      setToast(
-        savedId
-          ? `PDF generated + draft #${savedId} saved on server — edit anytime, Download removes it.`
-          : "PDF generated — click Download PDF",
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "PDF generation failed — please try again.";
-      setGenerateError(msg);
-      setToast(msg);
-      setPdfReady(false);
+      if (savedId) {
+        setGenerateError(null);
+        setToast(`Draft #${savedId} saved on server — edit anytime (paste more, remove any), Download removes it.`);
+      }
     } finally {
-      setGenerating(false);
+      setDraftSaving(false);
     }
   };
 
   const handleDownloadPdf = async () => {
-    if (generating) {
-      setToast("Please wait — generating PDF…");
+    if (generating || draftSaving) {
+      setToast("Please wait…");
       return;
     }
-    // Separate function from Generate: Download never builds the PDF, it
-    // only ships the generated blob — Generate PDF must come first.
-    if (!pdfBlob || !pdfReady) {
-      setToast("Click Generate PDF first, then Download.");
+    if (questions.length === 0) {
+      setToast("Nothing to download — add questions first.");
       return;
+    }
+    // Download builds the file on demand from the live preview, ships it,
+    // then removes the server draft — only when the download dispatched
+    // without errors. ANY failure above keeps the draft for a retry.
+    let blobToDownload: Blob | null = pdfBlob && pdfReady ? pdfBlob : null;
+    if (!blobToDownload) {
+      if (!previewRef.current) {
+        setToast("Preview not ready — please try again.");
+        return;
+      }
+      setGenerating(true);
+      setGenerateError(null);
+      try {
+        blobToDownload = await buildPdfBlob();
+        const url = URL.createObjectURL(blobToDownload);
+        setPdfBlob(blobToDownload);
+        setPdfUrl(url);
+        pdfUrlRef.current = url;
+        setPdfReady(true);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "PDF generation failed — please try again.";
+        setGenerateError(msg);
+        setToast(msg);
+        return;
+      } finally {
+        setGenerating(false);
+      }
     }
     try {
       const fileName = `${sanitizeFileName(materialName)}.pdf`;
-      triggerClientDownload(pdfBlob, fileName);
-      // Download dispatched without errors → remove the server draft so it
-      // can't be downloaded twice. ANY failure above keeps the draft.
+      triggerClientDownload(blobToDownload, fileName);
       if (draftId !== null) {
         try {
           const res = await fetch("/api/admin/material-drafts", {
@@ -1015,7 +1012,7 @@ export default function MaterialPdfGeneratorPage() {
               Materials PDF Generator
             </h1>
             <p className="mt-1 max-w-2xl text-xs leading-relaxed text-slate-500 sm:text-sm admin-dark:text-[#8da0c0]">
-              Choose a generator — paste questions, Detect &amp; Format, edit the A4 preview, then Generate PDF.
+              Choose a generator — paste questions, Detect &amp; Format, edit the A4 preview, then Save as Draft + Download.
             </p>
           </div>
 
@@ -1032,7 +1029,7 @@ export default function MaterialPdfGeneratorPage() {
                 MCQ PDF Generator
               </span>
               <span className="mt-1 block text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
-                Paste 10 / 20 / 50 / 100+ MCQs → Detect &amp; Format → editable two-column A4 preview with images, logo &amp; watermark → Generate PDF.
+                Paste 10 / 20 / 50 / 100+ MCQs → Detect &amp; Format → editable two-column A4 preview with images, logo &amp; watermark → Save as Draft + Download.
               </span>
               <span className="mt-4 inline-block rounded-xl bg-[#0b1e3a] px-5 py-2 text-xs font-extrabold text-white admin-dark:bg-[#234e9f]">
                 Open MCQ Generator →
@@ -1051,7 +1048,7 @@ export default function MaterialPdfGeneratorPage() {
                 CQ PDF Generator
               </span>
               <span className="mt-1 block text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
-                Paste creative questions (উদ্দীপক + ক / খ / গ / ঘ) → Detect &amp; Format → editable single-column A4 preview → Generate PDF.
+                Paste creative questions (উদ্দীপক + ক / খ / গ / ঘ) → Detect &amp; Format → editable single-column A4 preview → PDF Download.
               </span>
               <span className="mt-4 inline-block rounded-xl bg-emerald-600 px-5 py-2 text-xs font-extrabold text-white hover:bg-emerald-700">
                 Open CQ Generator →
@@ -1093,7 +1090,7 @@ export default function MaterialPdfGeneratorPage() {
             MCQ PDF Generator
           </h1>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-slate-500 sm:text-sm admin-dark:text-[#8da0c0]">
-            Material Name → Paste MCQs → Detect & Format → Editable A4 Preview → Generate PDF → Download. Two-column A4, never-split MCQ blocks, page-specific উত্তরমালা. Manual image insertion (no OCR).
+            Material Name → Paste MCQs → Detect & Format → Editable A4 Preview → Save as Draft → Download. Two-column A4, never-split MCQ blocks, page-specific উত্তরমালা. Manual image insertion (no OCR).
           </p>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <span className="text-xs font-bold text-slate-600 admin-dark:text-[#8da0c0]">
@@ -1127,7 +1124,7 @@ export default function MaterialPdfGeneratorPage() {
             2. From Uploaded Exam <span className="ml-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-extrabold text-emerald-700 admin-dark:bg-emerald-900/30 admin-dark:text-emerald-300">NEW</span>
           </label>
           <p className="mt-1 text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
-            Paste না করে uploaded/added exam থেকেও PDF বানানো যাবে — Draft / Published filter করো, search করে dropdown থেকে exam select করে Load দাও। নিচের A4 preview-এ edit করে Generate PDF।
+            Paste না করে uploaded/added exam থেকেও PDF বানানো যাবে — Draft / Published filter করো, search করে dropdown থেকে exam select করে Load দাও। নিচের A4 preview-এ edit করে Save as Draft দাও।
           </p>
           <div className="mt-3">
             {gate.ready ? (
@@ -1138,7 +1135,7 @@ export default function MaterialPdfGeneratorPage() {
           </div>
         </div>
 
-        {/* 2b. Server Drafts — Generate saves here, edit later, Download removes */}
+        {/* 2b. Server Drafts — Save as Draft stores here, edit later, Download removes */}
         <div className="mt-6 rounded-2xl border border-[#dbeafe] bg-white p-4 sm:p-6 shadow-sm admin-dark:border-[#1e3a65] admin-dark:bg-[#112544]">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <label className="text-sm font-extrabold text-[#0b1e3a] admin-dark:text-white">
@@ -1159,12 +1156,12 @@ export default function MaterialPdfGeneratorPage() {
             </button>
           </div>
           <p className="mt-1 text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
-            Generate PDF saves a draft on the server — load it later to paste more questions, remove any, and Generate again. Downloading removes the draft only after a successful download.
+            Save as Draft stores your work on the server — load it later to paste more questions, remove any, and save again. Downloading removes the draft only after a successful download.
           </p>
           {draftsLoading && drafts.length === 0 ? (
             <p className="mt-3 text-xs text-slate-400">Loading drafts…</p>
           ) : drafts.length === 0 ? (
-            <p className="mt-3 text-xs text-slate-400">No saved drafts yet — Generate PDF to create one.</p>
+            <p className="mt-3 text-xs text-slate-400">No saved drafts yet — Save as Draft to create one.</p>
           ) : (
             <ul className="mt-3 space-y-2">
               {drafts.map((d) => (
@@ -1478,7 +1475,7 @@ D. 150 দিন
           >
             {pages.map((page) => {
               const effScale = captureClean ? 1 : previewScale;
-              const measuredH = pageHeightRefs.current.get(page.pageNumber) ?? A4_PREVIEW_H;
+              const measuredH = pageHeights[page.pageNumber] ?? A4_PREVIEW_H;
               return (
               <Fragment key={page.pageNumber}>
                 {paginateDebugOn && (() => {
@@ -1508,7 +1505,7 @@ D. 150 দিন
               >
               <div
                 key={page.pageNumber}
-                ref={getPageRef(page.pageNumber)}
+                ref={pageRefCallbacks.get(page.pageNumber)}
                 className="a4-page relative flex w-full max-w-[794px] flex-col bg-white shadow-[0_8px_40px_rgba(0,0,0,.35)]"
                 style={{
                   width: "210mm",
@@ -1830,7 +1827,7 @@ D. 150 দিন
                               + Add Image to this question
                             </button>
                             <input
-                              ref={getQuestionFileRef(q.id)}
+                              ref={questionFileRefCallbacks.get(q.id)}
                               type="file"
                               accept="image/*"
                               className="hidden"
@@ -1963,7 +1960,7 @@ D. 150 দিন
           </div>
         )}
 
-        {/* 16. Generate PDF + 17. Download */}
+        {/* 16. Save as Draft + 17. Download */}
         {questions.length > 0 && (
           <>
             {generateError && (
@@ -1973,20 +1970,20 @@ D. 150 দিন
             )}
             <div className="mt-6 flex flex-wrap justify-center gap-3">
               <button
-                onClick={handleGeneratePdf}
-                disabled={generating}
+                onClick={handleSaveDraft}
+                disabled={generating || draftSaving}
                 className="rounded-xl bg-[#0b1e3a] px-8 py-3 text-sm font-extrabold text-white shadow hover:bg-[#123060] disabled:opacity-40 admin-dark:bg-[#234e9f]"
-                title={generating ? "Generating PDF…" : "Generate PDF"}
+                title={draftSaving ? "Saving draft…" : draftId !== null ? `Update server draft #${draftId}` : "Save as Draft on the server (editable later)"}
               >
-                {generating ? "Generating PDF…" : "Generate PDF"}
+                {draftSaving ? "Saving Draft…" : draftId !== null ? `Update Draft #${draftId}` : "Save as Draft"}
               </button>
               <button
                 onClick={handleDownloadPdf}
-                disabled={generating}
+                disabled={generating || draftSaving}
                 className="rounded-xl border border-[#cbd5e1] bg-white px-6 py-3 text-sm font-bold text-[#0b1e3a] hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
-                title={generating ? "Generating PDF…" : pdfReady ? "Download PDF to your device (removes the server draft)" : "Generate PDF first, then Download"}
+                title={generating ? "Building PDF…" : "Download PDF to your device (removes the server draft after success)"}
               >
-                {generating ? "Preparing…" : "Download PDF"}
+                {generating ? "Building PDF…" : "Download PDF"}
               </button>
             </div>
             {pdfReady && !generating ? (
@@ -1996,14 +1993,14 @@ D. 150 দিন
               </p>
             ) : !pdfReady && !generating && questions.length > 0 ? (
               <p className="mt-2 text-center text-xs text-slate-500 admin-dark:text-[#8da0c0]">
-                Tip: Generate PDF saves a server draft (editable later) — Download only ships the file and removes the draft
+                Tip: Save as Draft keeps your work on the server (editable later) — Download builds the file and removes the draft
               </p>
             ) : null}
           </>
         )}
 
         <p className="mt-6 text-center text-xs text-slate-400 admin-dark:text-[#8da0c0]">
-          MediSpark Material PDF Generator • Focused tool: Material Name → Paste → Detect & Format → Edit → Generate → Download • Two-column A4 • Professional print-ready • Images manual only (no OCR)
+          MediSpark Material PDF Generator • Focused tool: Material Name → Paste → Detect & Format → Edit → Save as Draft → Download • Two-column A4 • Professional print-ready • Images manual only (no OCR)
         </p>
       </div>
 
