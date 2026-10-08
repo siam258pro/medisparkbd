@@ -687,6 +687,8 @@ export default function MaterialPdfGeneratorPage() {
     // Suspend mobile display scaling so html2canvas captures the full 794px page.
     setCaptureClean(true);
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    let pageEls: HTMLElement[] = [];
+    let originalDisplays: string[] = [];
     try {
     const [{ default: jsPDF }, { default: html2canvas }] = await Promise.all([
       import("jspdf"),
@@ -709,11 +711,11 @@ export default function MaterialPdfGeneratorPage() {
     );
     await new Promise((r) => setTimeout(r, 300));
     const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-    const pageEls = Array.from(previewRef.current.querySelectorAll<HTMLElement>(".a4-page"));
+    pageEls = Array.from(previewRef.current.querySelectorAll<HTMLElement>(".a4-page"));
     if (!pageEls || pageEls.length === 0) throw new Error("Preview not ready");
     // Capture one page at a time with the rest hidden: layout/paint cost
     // drops to a single page and the tab stays responsive. Always restored.
-    const originalDisplays = pageEls.map((el) => el.style.display);
+    originalDisplays = pageEls.map((el) => el.style.display);
     onProgress?.(0, pageEls.length);
     for (let i = 0; i < pageEls.length; i++) {
       const el = pageEls[i];
