@@ -2099,6 +2099,36 @@ D. 150 দিন
                 </p>
               </div>
             )}
+            {/* Centered build popup with blurred backdrop */}
+            {generating && buildProgress && buildProgress.total > 0 && (
+              <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="Building PDF">
+                <div className="w-full max-w-sm rounded-2xl border border-[#dbeafe] bg-white p-6 text-center shadow-2xl admin-dark:border-[#1e3a65] admin-dark:bg-[#112544]">
+                  <div className="mx-auto h-12 w-12 animate-spin rounded-full border-4 border-[#dbeafe] border-t-[#0b1e3a] admin-dark:border-[#1e3a65] admin-dark:border-t-[#3b82f6]" />
+                  <p className="mt-4 text-base font-extrabold text-[#0b1e3a] admin-dark:text-white">
+                    Building PDF… {Math.round((buildProgress.done / buildProgress.total) * 100)}%
+                  </p>
+                  <p className="mt-1 text-xs font-semibold text-slate-500 admin-dark:text-slate-400">
+                    Page {Math.min(buildProgress.done + 1, buildProgress.total)} of {buildProgress.total} • {sanitizeFileName(materialName)}.pdf
+                  </p>
+                  <div
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={buildProgress.total}
+                    aria-valuenow={buildProgress.done}
+                    aria-label="Building PDF progress"
+                    className="mt-4 h-2.5 w-full overflow-hidden rounded-full bg-[#dbeafe] admin-dark:bg-[#1e3a65]"
+                  >
+                    <div
+                      className="h-full rounded-full bg-[#0b1e3a] transition-[width] duration-300 admin-dark:bg-[#3b82f6]"
+                      style={{ width: `${Math.round((buildProgress.done / buildProgress.total) * 100)}%` }}
+                    />
+                  </div>
+                  <p className="mt-3 text-[11px] leading-relaxed text-slate-400 admin-dark:text-slate-500">
+                    Large files take a few minutes — please keep this tab open.
+                  </p>
+                </div>
+              </div>
+            )}
             {pdfReady && !generating ? (
               <p className="mt-2 text-center text-xs font-semibold text-emerald-700 admin-dark:text-emerald-300">
                 ✓ PDF ready{draftId !== null ? ` + draft #${draftId} saved on server` : ""} — click Download PDF to save {sanitizeFileName(materialName)}.pdf to your device
