@@ -29,6 +29,50 @@ function uid() {
   return `q-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+/**
+ * contentEditable hardening: pasting rich HTML or pressing Enter makes the
+ * browser insert element nodes (<div>/<br>/<b>…) that React never rendered.
+ * On the next state update React tries to reconcile them and crashes with
+ * "Failed to execute 'removeChild'". Forcing plain-text paste + explicit
+ * Enter behavior keeps the DOM to plain text nodes so edits never crash.
+ */
+function insertTextAtCaret(text: string) {
+  try {
+    if (document.execCommand("insertText", false, text)) return;
+  } catch {}
+  try {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    range.deleteContents();
+    const node = document.createTextNode(text);
+    range.insertNode(node);
+    sel.removeAllRanges();
+    const after = document.createRange();
+    after.setStartAfter(node);
+    after.collapse(true);
+    sel.addRange(after);
+  } catch {}
+}
+
+function handleEditablePaste(e: React.ClipboardEvent) {
+  e.preventDefault();
+  const text = e.clipboardData?.getData("text/plain") ?? "";
+  if (text) insertTextAtCaret(text);
+}
+
+function handleEditableEnterNewline(e: React.KeyboardEvent) {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  insertTextAtCaret("\n");
+}
+
+function handleEditableEnterBlur(e: React.KeyboardEvent) {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  (e.target as HTMLElement).blur();
+}
+
 /** A4 preview width in px (210mm @96dpi) — must match the .a4-page inline width. */
 const A4_PREVIEW_W = 794;
 /** A4 preview height in px (297mm @96dpi) — fallback until measured. */
@@ -1637,6 +1681,7 @@ D. 150 দিন
                         const txt = (e.currentTarget.innerText || "").trim();
                         if (txt) setMaterialName(txt);
                       }}
+                      onKeyDown={handleEditableEnterBlur} onPaste={handleEditablePaste}
                       title="Click to edit Material Name (updates across all pages)"
                     >
                       {materialName.trim() || "SSC Academic Biology"}
@@ -1662,6 +1707,7 @@ D. 150 দিন
                         const txt = (e.currentTarget.innerText || "").trim();
                         if (txt) setMaterialName(txt);
                       }}
+                      onKeyDown={handleEditableEnterBlur} onPaste={handleEditablePaste}
                       title="Click to edit Material Name"
                     >
                       {materialName.trim() || "SSC Academic Biology"}
@@ -1674,6 +1720,7 @@ D. 150 দিন
                         const txt = (e.currentTarget.innerText || "").trim();
                         setSubtitle(txt);
                       }}
+                      onKeyDown={handleEditableEnterBlur} onPaste={handleEditablePaste}
                       title="Click to edit Subtitle"
                     >
                       {subtitle || "MCQ Practice Material"}
@@ -1732,6 +1779,7 @@ D. 150 দিন
                                   if (txt && txt !== q.topic) handleRenameTopic(q.topic ?? "", txt);
                                   else e.currentTarget.innerText = q.topic ?? "";
                                 }}
+                                onKeyDown={handleEditableEnterBlur} onPaste={handleEditablePaste}
                                 title="Click to rename topic (updates whole group)"
                               >
                                 {q.topic}
@@ -1840,6 +1888,7 @@ D. 150 দিন
                               const txt = raw === "" || raw.startsWith("[Empty") ? "" : raw;
                               if (txt !== q.question) handleUpdate(q.id, { question: txt });
                             }}
+                            onKeyDown={handleEditableEnterNewline} onPaste={handleEditablePaste}
                             title="Click to edit question (bold in PDF) — statements (1. 2. 3.) remain with question as one block"
                             style={{ lineHeight: `${lineHeightStyle * 1.1}`, whiteSpace: "pre-line" } as React.CSSProperties}
                           >
@@ -1947,6 +1996,7 @@ D. 150 দিন
                                     handleUpdate(q.id, { options: next });
                                   }
                                 }}
+                                onKeyDown={handleEditableEnterNewline} onPaste={handleEditablePaste}
                                 title={`Click to edit Option ${ltr}`}
                                 style={{ lineHeight: `${lineHeightStyle}` }}
                               >
