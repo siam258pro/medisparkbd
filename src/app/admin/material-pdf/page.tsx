@@ -1985,6 +1985,16 @@ D. 150 দিন
               >
                 {generating ? "Building PDF…" : "Download PDF"}
               </button>
+              {draftId !== null && (
+                <button
+                  onClick={() => void handleDeleteDraft(draftId)}
+                  disabled={generating || draftSaving || draftBusy !== null}
+                  className="rounded-xl border border-red-200 bg-white px-6 py-3 text-sm font-bold text-red-600 hover:bg-red-50 disabled:opacity-40 admin-dark:border-red-900/40 admin-dark:bg-transparent admin-dark:text-red-300 admin-dark:hover:bg-red-500/10"
+                  title={`Delete server draft #${draftId} permanently (local preview stays)`}
+                >
+                  {draftBusy === `delete-${draftId}` ? "Deleting…" : `Delete Draft #${draftId}`}
+                </button>
+              )}
             </div>
             {pdfReady && !generating ? (
               <p className="mt-2 text-center text-xs font-semibold text-emerald-700 admin-dark:text-emerald-300">
