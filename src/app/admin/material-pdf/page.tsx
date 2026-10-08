@@ -21,6 +21,9 @@ import { useAdminGate } from "@/components/admin/admin-ui";
 /** Main generator selection — exactly TWO cards, never a third "setup" card. */
 type GeneratorMode = "select" | "mcq" | "cq";
 
+/** Hard cap: one material holds at most 500 blocks (questions + images). */
+const MAX_MATERIAL_QUESTIONS = 500;
+
 function uid() {
   return `q-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -335,6 +338,10 @@ export default function MaterialPdfGeneratorPage() {
       setToast("No MCQs detected. Check format.");
       return;
     }
+    if (mapped.length > MAX_MATERIAL_QUESTIONS) {
+      setToast(`Too many questions (${mapped.length}) — one material holds max ${MAX_MATERIAL_QUESTIONS}. Split into two materials.`);
+      return;
+    }
     const sanitized = sanitizeQuestions(mapped);
     const topicCount = new Set(sanitized.map((q) => q.topic ?? "")).size;
     setQuestions(sanitized);
@@ -353,6 +360,11 @@ export default function MaterialPdfGeneratorPage() {
   ) => {
     if (loaded.length === 0) {
       setToast("This exam has no usable questions.");
+      return;
+    }
+    const wouldHold = loadMode === "append" && questions.length > 0 ? questions.length + loaded.length : loaded.length;
+    if (wouldHold > MAX_MATERIAL_QUESTIONS) {
+      setToast(`Too many questions (${wouldHold}) — one material holds max ${MAX_MATERIAL_QUESTIONS}.`);
       return;
     }
     // Exam content starts a fresh local session (not linked to a server draft).
@@ -489,6 +501,10 @@ export default function MaterialPdfGeneratorPage() {
     }
     try {
       const dataUrl = await fileToDataUrl(file);
+      if (questions.length >= MAX_MATERIAL_QUESTIONS) {
+        setToast(`Material is full (max ${MAX_MATERIAL_QUESTIONS}) — remove something first.`);
+        return;
+      }
       const newBlock: PdfMaterialQuestion = {
         id: uid(),
         qNumber: 0,
@@ -918,6 +934,11 @@ export default function MaterialPdfGeneratorPage() {
       setGenerateError("No questions to save.");
       return;
     }
+    if (questions.length > MAX_MATERIAL_QUESTIONS) {
+      setToast(`Too many questions (${questions.length}) — max ${MAX_MATERIAL_QUESTIONS} per material.`);
+      setGenerateError(`Too many questions — max ${MAX_MATERIAL_QUESTIONS} per material.`);
+      return;
+    }
     setDraftSaving(true);
     setGenerateError(null);
     try {
@@ -938,6 +959,10 @@ export default function MaterialPdfGeneratorPage() {
     }
     if (questions.length === 0) {
       setToast("Nothing to download — add questions first.");
+      return;
+    }
+    if (questions.length > MAX_MATERIAL_QUESTIONS) {
+      setToast(`Too many questions (${questions.length}) — max ${MAX_MATERIAL_QUESTIONS} per material. Split it first.`);
       return;
     }
     // Download builds the file on demand from the live preview, ships it,
@@ -1379,7 +1404,7 @@ export default function MaterialPdfGeneratorPage() {
         <div className="mt-6 rounded-2xl border border-[#dbeafe] bg-white p-4 sm:p-6 shadow-sm admin-dark:border-[#1e3a65] admin-dark:bg-[#112544]">
           <label className="text-sm font-extrabold text-[#0b1e3a] admin-dark:text-white">3. Paste MCQs (alternative)</label>
           <p className="mt-1 text-xs leading-relaxed text-slate-500 admin-dark:text-[#8da0c0]">
-            Paste 10 / 20 / 50 / 100+ MCQs at once. Any numbering (25, 31, 47…) will be auto-renumbered to 1,2,3… Bangla + English mixed, Unicode fully supported.
+            Paste 10 / 20 / 50 / 100+ MCQs at once (max 500 per material). Any numbering (25, 31, 47…) will be auto-renumbered to 1,2,3… Bangla + English mixed, Unicode fully supported.
           </p>
           <textarea
             value={pasteText}
