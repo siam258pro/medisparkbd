@@ -8,6 +8,7 @@ import type { PdfMaterialQuestion } from "@/lib/pdf-materials";
 import {
   paginateQuestionsDebug,
   logPaginateDebug,
+  columnSpreadExtra,
   type PaginatedPage,
   type PaginateDebugInfo,
   type LineSpacing,
@@ -1669,12 +1670,19 @@ D. 150 দিন
 
                 {/* 4 & 5. Two-Column Page Layout with vertical center divider */}
                 <div className="relative mt-2.5 flex flex-1 gap-[18px]">
-                  {page.columns.map((colBlocks, ci) => (
+                  {page.columns.map((colBlocks, ci) => {
+                    // Spread genuine leftover evenly between this column's
+                    // blocks (order untouched) so no MCQ-sized hole remains.
+                    const dbg = debug.pages[page.pageNumber - 1];
+                    const spread = dbg
+                      ? columnSpreadExtra(dbg.columnBudgetH, dbg.colUsedH[ci] ?? 0, colBlocks.length, dbg.fillRatio)
+                      : 0;
+                    return (
                     <Fragment key={ci}>
                       {ci === 1 && (
                         <div aria-hidden="true" className="w-px shrink-0 self-stretch bg-[#1e293b]" />
                       )}
-                      <div className="min-w-0 flex-1">
+                      <div className="min-w-0 flex-1" data-col-spread={spread > 0 ? Math.round(spread) : undefined}>
                   {/* Blocks: questions + standalone images interleaved already via pagination */}
                   {colBlocks.map((q, qi) => {
                     const prevInCol = qi === 0 ? null : colBlocks[qi - 1];
@@ -1751,7 +1759,7 @@ D. 150 দিন
                       <div
                         key={q.id}
                         className="mb-3 break-inside-avoid rounded border border-[#cbd5e1] bg-[#f8fafc] p-2"
-                        style={{ breakInside: "avoid", pageBreakInside: "avoid", WebkitColumnBreakInside: "avoid" } as React.CSSProperties}
+                        style={{ breakInside: "avoid", pageBreakInside: "avoid", WebkitColumnBreakInside: "avoid", ...(spread > 0 ? { marginBottom: 12 + spread } : null) } as React.CSSProperties}
                       >
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-[9px] font-bold text-slate-500">Image Block</span>
@@ -1802,7 +1810,7 @@ D. 150 দিন
                       <div
                         key={q.id}
                         className="mb-3 break-inside-avoid rounded-[2px] p-1"
-                        style={{ breakInside: "avoid", pageBreakInside: "avoid", WebkitColumnBreakInside: "avoid" } as React.CSSProperties}
+                        style={{ breakInside: "avoid", pageBreakInside: "avoid", WebkitColumnBreakInside: "avoid", ...(spread > 0 ? { marginBottom: 12 + spread } : null) } as React.CSSProperties}
                       >
                         {/* Question text Bold — automatic continuous numbering */}
                         <div className="flex gap-1.5">
@@ -1958,7 +1966,8 @@ D. 150 দিন
                   })}
                       </div>
                     </Fragment>
-                  ))}
+                    );
+                  })}
                   {page.questions.length === 0 && (
                     <p className="py-10 text-center text-sm text-slate-400">No questions</p>
                   )}

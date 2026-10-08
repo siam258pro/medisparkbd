@@ -13,6 +13,7 @@ import {
   isExplicitTopicHeader,
   questionsToPasteText,
 } from "../src/lib/material-pdf-utils.ts";
+import { columnSpreadExtra } from "../src/components/admin/MaterialPdf/pagination.ts";
 import { parsePastedMcqs } from "../src/lib/paste-mcq-parser.ts";
 import type { PdfMaterialQuestion } from "../src/lib/pdf-materials.ts";
 
@@ -383,5 +384,22 @@ Answer: B`;
     }
     assert.equal(total, 3);
     assert.deepEqual(got, ["B", "D", "A"]);
+  });
+});
+
+describe("Section 29: column spread leaves no visible holes", () => {
+  it("spreads genuine leftover on well-filled multi-block columns", () => {
+    // 100px slack over 5 blocks -> 20px extra per block
+    assert.equal(columnSpreadExtra(700, 600, 5, 0.85), 20);
+  });
+
+  it("stays top-aligned for sparse pages, single blocks and tiny slacks", () => {
+    assert.equal(columnSpreadExtra(700, 200, 5, 0.4), 0); // sparse page
+    assert.equal(columnSpreadExtra(700, 600, 1, 0.9), 0); // single block
+    assert.equal(columnSpreadExtra(700, 690, 5, 0.95), 0); // 10px slack
+  });
+
+  it("caps per-gap extra so drift can never overflow", () => {
+    assert.equal(columnSpreadExtra(700, 400, 5, 0.9), 24); // 60 -> capped
   });
 });

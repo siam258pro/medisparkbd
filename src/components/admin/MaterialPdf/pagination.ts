@@ -378,7 +378,6 @@ export function paginateQuestionsDebug(
     });
     flushPage();
     col = 0;
-    const nextPNo = curPageNo();
     const showFresh = headerFor(q, topic);
     const freshNeed = baseH + (showFresh ? TOPIC_HEADER_HEIGHT_PX : 0);
     place(q, freshNeed, topic, 0, showFresh);
@@ -429,6 +428,31 @@ export function logPaginateDebug(debug: PaginateDebugInfo): void {
   }
    
   console.groupEnd();
+}
+
+/**
+ * Evenly spread a column's leftover budget between its blocks so no
+ * visible hole remains at the column bottom. Order is untouched — only
+ * inter-block spacing grows. Returns the EXTRA marginBottom (px) per block
+ * root (on top of the regular mb-3), or 0 to keep the column top-aligned.
+ *
+ * Guards: single-block columns can't spread; sparse pages (e.g. the last
+ * one) stay top-aligned; tiny slacks aren't worth touching; per-gap extra
+ * is capped so estimates-vs-reality drift can never overflow the column.
+ */
+export const COLUMN_SPREAD_MIN_SLACK_PX = 24;
+export const COLUMN_SPREAD_MAX_GAP_PX = 24;
+export const COLUMN_SPREAD_MIN_FILL = 0.7;
+export function columnSpreadExtra(
+  columnBudgetH: number,
+  colUsedH: number,
+  blockCount: number,
+  fillRatio: number,
+): number {
+  if (blockCount <= 1 || fillRatio < COLUMN_SPREAD_MIN_FILL) return 0;
+  const slack = columnBudgetH - colUsedH;
+  if (!(slack > COLUMN_SPREAD_MIN_SLACK_PX)) return 0;
+  return Math.min(slack / blockCount, COLUMN_SPREAD_MAX_GAP_PX);
 }
 
 export const ANSWER_LABELS = {
