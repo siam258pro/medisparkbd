@@ -90,6 +90,8 @@ export default function MaterialPdfGeneratorPage() {
   const [draftBusy, setDraftBusy] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [draftSaving, setDraftSaving] = useState(false);
+  /** Live PDF-build progress (pages done/total). Null when idle. */
+  const [buildProgress, setBuildProgress] = useState<{ done: number; total: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
@@ -674,8 +676,10 @@ export default function MaterialPdfGeneratorPage() {
     }
   };
 
-  // Shared core: build PDF Blob client-side (no server round-trip)
-  const buildPdfBlob = async (): Promise<Blob> => {
+  // Shared core: build PDF Blob client-side (no server round-trip).
+  // Reports per-page progress so the Download button shows live %.
+  // Yields between pages so React paints the bar instead of hanging.
+  const buildPdfBlob = async (onProgress?: (done: number, total: number) => void): Promise<Blob> => {
     if (questions.length === 0) throw new Error("No questions to generate.");
     if (!previewRef.current) throw new Error("Preview not ready — please try again.");
     // Suspend mobile display scaling so html2canvas captures the full 794px page.
@@ -705,8 +709,12 @@ export default function MaterialPdfGeneratorPage() {
     const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
     const pageEls = previewRef.current.querySelectorAll<HTMLElement>(".a4-page");
     if (!pageEls || pageEls.length === 0) throw new Error("Preview not ready");
+    onProgress?.(0, pageEls.length);
     for (let i = 0; i < pageEls.length; i++) {
       const el = pageEls[i];
+      // Let the browser paint (progress bar) before the next heavy capture.
+      await new Promise((r) => setTimeout(r, 0));
+      onProgress?.(i, pageEls.length);
       const restoreTextBaseline = fixHtml2CanvasTextBaseline(document);
       const canvas = await html2canvas(el, {
         scale: 2,
@@ -735,6 +743,7 @@ export default function MaterialPdfGeneratorPage() {
       const rect = capturePageRect(canvas.width, canvas.height, pageW, pageH);
       pdf.addImage(imgData, "JPEG", rect.x, rect.y, rect.w, rect.h, undefined, "FAST");
     }
+    onProgress?.(pageEls.length, pageEls.length);
     const blob: Blob = pdf.output("blob");
     if (!blob || blob.size === 0) throw new Error("Generated PDF is empty — please try again.");
     return blob;
@@ -911,8 +920,11 @@ export default function MaterialPdfGeneratorPage() {
       }
       setGenerating(true);
       setGenerateError(null);
+      setBuildProgress({ done: 0, total: 1 });
       try {
-        blobToDownload = await buildPdfBlob();
+        blobToDownload = await buildPdfBlob((done, total) => {
+          setBuildProgress({ done, total });
+        });
         const url = URL.createObjectURL(blobToDownload);
         setPdfBlob(blobToDownload);
         setPdfUrl(url);
@@ -925,6 +937,7 @@ export default function MaterialPdfGeneratorPage() {
         return;
       } finally {
         setGenerating(false);
+        setBuildProgress(null);
       }
     }
     try {
@@ -1983,7 +1996,11 @@ D. 150 দিন
                 className="rounded-xl border border-[#cbd5e1] bg-white px-6 py-3 text-sm font-bold text-[#0b1e3a] hover:bg-slate-50 disabled:opacity-40 admin-dark:border-[#1e3a65] admin-dark:bg-[#0f2547] admin-dark:text-white"
                 title={generating ? "Building PDF…" : "Download PDF to your device (removes the server draft after success)"}
               >
-                {generating ? "Building PDF…" : "Download PDF"}
+                {generating && buildProgress && buildProgress.total > 0
+                  ? `Building ${Math.round((buildProgress.done / buildProgress.total) * 100)}%`
+                  : generating
+                    ? "Building PDF…"
+                    : "Download PDF"}
               </button>
               {draftId !== null && (
                 <button
@@ -1996,6 +2013,26 @@ D. 150 দিন
                 </button>
               )}
             </div>
+            {generating && buildProgress && buildProgress.total > 0 && (
+              <div
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={buildProgress.total}
+                aria-valuenow={buildProgress.done}
+                aria-label="Building PDF"
+                className="mx-auto mt-3 max-w-md space-y-1"
+              >
+                <div className="h-2 w-full overflow-hidden rounded-full bg-[#dbeafe] admin-dark:bg-[#1e3a65]">
+                  <div
+                    className="h-full rounded-full bg-[#0b1e3a] transition-[width] duration-300 admin-dark:bg-[#3b82f6]"
+                    style={{ width: `${Math.round((buildProgress.done / buildProgress.total) * 100)}%` }}
+                  />
+                </div>
+                <p className="text-center text-[11px] font-bold text-slate-600 admin-dark:text-slate-300">
+                  Building PDF… page {Math.min(buildProgress.done + 1, buildProgress.total)}/{buildProgress.total} ({Math.round((buildProgress.done / buildProgress.total) * 100)}%)
+                </p>
+              </div>
+            )}
             {pdfReady && !generating ? (
               <p className="mt-2 text-center text-xs font-semibold text-emerald-700 admin-dark:text-emerald-300">
                 ✓ PDF ready{draftId !== null ? ` + draft #${draftId} saved on server` : ""} — click Download PDF to save {sanitizeFileName(materialName)}.pdf to your device
