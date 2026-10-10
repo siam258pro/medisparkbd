@@ -441,7 +441,7 @@ export default function CqPdfGenerator({ onBack }: { onBack: () => void }) {
       const canvas = await html2canvas(el, {
         scale: 2,
         useCORS: true,
-        allowTaint: true,
+        allowTaint: false,
         backgroundColor: "#ffffff",
         logging: false,
         onclone: (clonedDoc) => {
