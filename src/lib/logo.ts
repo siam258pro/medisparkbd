@@ -10,8 +10,8 @@ export type LogoInfo = {
 export const DEFAULT_LOGO: LogoInfo = {
   fileName: "default",
   url: "/assets/images/medispark-logo.png",
-  width: 1536,
-  height: 683,
+  width: 977,
+  height: 255,
   updatedAt: 0,
   updatedBy: null,
 };
