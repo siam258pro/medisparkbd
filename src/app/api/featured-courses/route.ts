@@ -17,8 +17,7 @@ export async function GET() {
 
 /** Replace the full featured list (select / toggle / reorder). */
 export async function PUT(request: NextRequest) {
-  const admin = await requirePermission(request, "manageCourses");
-  if (!admin) {
+  if (!(await requirePermission(request, "manageCourses"))) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
   }
 
@@ -36,7 +35,6 @@ export async function PUT(request: NextRequest) {
   try {
     const courses = await saveFeaturedCourses(
       body.courses as Array<Record<string, unknown>>,
-      admin.uid,
     );
     return NextResponse.json({ courses });
   } catch (error) {

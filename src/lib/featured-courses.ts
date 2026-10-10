@@ -102,7 +102,6 @@ export type FeaturedCourseInput = {
  */
 export async function saveFeaturedCourses(
   items: Array<Record<string, unknown>>,
-  _adminUid: string,
 ): Promise<FeaturedCourseRecord[]> {
   const slugs: string[] = [];
   for (const raw of items) {

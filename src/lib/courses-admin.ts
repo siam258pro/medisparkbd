@@ -1199,22 +1199,18 @@ export async function updateCourseSubject(
 }
 
 /**
- * Course options for assignment pickers — DB catalog first,
- * static fallback catalog when the DB has no courses yet.
+ * Course options for assignment pickers — DB catalog only.
+ * Empty when no courses are added yet, never static placeholders.
  */
 export async function fetchCourseOptions(): Promise<
   Array<{ slug: string; name: string }>
 > {
   try {
     const catalog = await fetchCatalogCourses();
-    if (catalog.length > 0) {
-      return catalog.map((course) => ({ slug: course.slug, name: course.name }));
-    }
+    return catalog.map((course) => ({ slug: course.slug, name: course.name }));
   } catch {
-    // Fall through to the static catalog.
+    return [];
   }
-  const { courses } = await import("@/lib/courses");
-  return courses.map((course) => ({ slug: course.slug, name: course.name }));
 }
 export const fetchCourseSubjects = () => fetchTaxonomy("course_subjects");
 export const saveCourseSubjects = (items: Array<Record<string, unknown>>) =>

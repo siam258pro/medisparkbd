@@ -1,12 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { AccessLoading, AccessMessage } from "@/components/auth/AccessGuard";
 import { useAdminToast } from "@/components/admin/AdminToastProvider";
 import AdminConfirmDialog from "@/components/admin/AdminConfirmDialog";
-import { getPublicCourses, getPayableFee, formatFee } from "@/lib/courses";
+import { formatFee } from "@/lib/courses";
 import type { AdminEnrollment } from "@/lib/enrollments-admin";
+
+type CourseOption = {
+  slug: string;
+  name: string;
+  fee: number;
+  discountFee: number | null;
+};
+
+/** Payable amount — mirrors getPayableFee for the DB option shape. */
+function optionPayable(course: CourseOption): number {
+  return course.discountFee != null ? course.discountFee : course.fee;
+}
 
 type StatusFilter = "all" | "pending" | "active" | "cancelled" | "completed";
 
@@ -61,7 +73,8 @@ export default function StudentEnrollmentsPage() {
   // Remove confirm
   const [removeTarget, setRemoveTarget] = useState<AdminEnrollment | null>(null);
 
-  const courseOptions = useMemo(() => getPublicCourses(), []);
+  // Assign-course dropdown options — live DB catalog only, never placeholders.
+  const [courseOptions, setCourseOptions] = useState<CourseOption[]>([]);
 
   // Admin check
   useEffect(() => {
@@ -132,8 +145,7 @@ export default function StudentEnrollmentsPage() {
     user
       .getIdToken()
       .then((token) =>
-        fetch("/api/admin/students?status=active", {
-          headers: { Authorization: `Bearer ${token}` },
+        fetch("/api/admin/students?status=active", {          headers: { Authorization: `Bearer ${token}` },
           cache: "no-store",
         }),
       )
@@ -146,6 +158,29 @@ export default function StudentEnrollmentsPage() {
             label: `${student.fullName} (${student.studentId})`,
           })),
         );
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [adminStatus, user]);
+
+  // Load live course options once for the assign-course dropdown.
+  useEffect(() => {
+    if (adminStatus !== "admin" || !user) return;
+    let cancelled = false;
+    user
+      .getIdToken()
+      .then((token) =>
+        fetch("/api/admin/enrollments/courses", {
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        }),
+      )
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data: { courses?: CourseOption[] } | null) => {
+        if (cancelled || !data?.courses) return;
+        setCourseOptions(data.courses);
       })
       .catch(() => undefined);
     return () => {
@@ -317,7 +352,7 @@ export default function StudentEnrollmentsPage() {
             <option value="">Select course…</option>
             {courseOptions.map((course) => (
               <option key={course.slug} value={course.slug}>
-                {course.name} — {formatFee(getPayableFee(course))}
+                {course.name} — {formatFee(optionPayable(course))}
               </option>
             ))}
           </select>

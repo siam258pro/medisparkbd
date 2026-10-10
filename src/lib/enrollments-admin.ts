@@ -1,6 +1,6 @@
 import { query, exec, withTransaction } from "@/lib/mysql";
 import type { PoolConnection, RowDataPacket, ResultSetHeader } from "mysql2/promise";
-import { getCourse, getPayableFee } from "@/lib/courses";
+import { fetchCatalogCourse, fetchCatalogCourses } from "@/lib/courses-admin";
 import type { EnrollmentStatus } from "@/lib/enrollments";
 import { getPaymentCard as getManagedPaymentCard } from "@/lib/payment-card";
 
@@ -91,8 +91,11 @@ function normalizeStatus(value: string): EnrollmentStatus {
     : "pending";
 }
 
-function mapEnrollment(row: EnrollmentRow): AdminEnrollment {
-  const course = getCourse(row.course_id);
+function mapEnrollment(
+  row: EnrollmentRow,
+  catalogFeeBySlug?: Map<string, number>,
+): AdminEnrollment {
+  const catalogFee = catalogFeeBySlug?.get(row.course_id);
   return {
     id: toNumber(row.id),
     studentUid: row.student_uid,
@@ -114,7 +117,10 @@ function mapEnrollment(row: EnrollmentRow): AdminEnrollment {
         : toNumber(row.payment_amount) || null,
     paymentSender: row.payment_sender ?? null,
     paymentMethod: row.payment_method ?? null,
-    originalFee: course && course.fee > 0 ? course.fee : (toNumber(row.fee) || null),
+    originalFee:
+      catalogFee !== undefined && catalogFee > 0
+        ? catalogFee
+        : toNumber(row.fee) || null,
     couponCode: row.coupon_code ?? null,
     paymentDate: parseTime(row.payment_created_at ?? null),
     approvedAt: parseTime(row.approved_at ?? null),
@@ -151,6 +157,19 @@ const PAYMENT_JOIN = `
 
 // Back-compat alias used by older code paths (base select without payment join).
 const SELECT_ENROLLMENTS = `${SELECT_BASE}${FROM_CLAUSE}`;
+
+/** slug → base catalog fee, best-effort (empty when DB unreachable). */
+async function loadCatalogFeeMap(): Promise<Map<string, number>> {
+  try {
+    const map = new Map<string, number>();
+    for (const course of await fetchCatalogCourses()) {
+      if (typeof course.fee === "number") map.set(course.slug, course.fee);
+    }
+    return map;
+  } catch {
+    return new Map<string, number>();
+  }
+}
 
 /** All enrollments with student info — supports search + status filter. */
 export async function fetchEnrollmentsAdmin(
@@ -193,7 +212,8 @@ export async function fetchEnrollmentsAdmin(
         params,
       );
     }
-    return rows.map(mapEnrollment);
+    const catalogFeeBySlug = await loadCatalogFeeMap();
+    return rows.map((row) => mapEnrollment(row, catalogFeeBySlug));
   } catch {
     return [];
   }
@@ -422,20 +442,20 @@ export async function rejectEnrollmentApplication(
 
 /**
  * Assign a course to a student (admin grant). Creates the enrollment or
- * re-activates an existing/cancelled one. Course data comes from the static
- * catalog so name/type/kind/fee stay consistent.
+ * re-activates an existing/cancelled one. Course data comes from the live
+ * DB catalog so name/type/kind/fee stay consistent.
  */
 export async function assignCourseToStudent(
   studentUid: string,
   courseId: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  const course = getCourse(courseId);
+  const course = await fetchCatalogCourse(courseId.trim());
   if (!course) {
     return { ok: false, error: "Unknown course." };
   }
 
-  const courseKind = getPayableFee(course) > 0 ? "paid" : "free";
-  const fee = getPayableFee(course);
+  const fee = course.discountFee ?? course.fee;
+  const courseKind = fee > 0 ? "paid" : "free";
 
   try {
     await query("INSERT IGNORE INTO courses (course_id, kind) VALUES (?, ?)", [

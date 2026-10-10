@@ -172,7 +172,7 @@ export async function getLiveCourse(
   return undefined;
 }
 
-/** Latest-batch featured courses (mirrors getFeaturedCourses). */
+/** Latest-batch featured courses from the live catalog. */
 export async function getLiveFeaturedCourses(): Promise<Course[]> {
   const publicCourses = await getLivePublicCourses();
   if (publicCourses.length === 0) return [];
