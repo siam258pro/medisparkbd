@@ -1,15 +1,14 @@
 import { fetchCatalogCourse as fetchCatalogCourseBase, fetchCatalogCourses, type CatalogCourse } from "@/lib/courses-admin";
 import { query } from "@/lib/mysql";
 import {
-  courses as staticCourses,
   type Course,
   type CourseStatus,
   type CourseAvailability,
 } from "@/lib/courses";
 
 // Live course catalog: reads the MySQL `catalog_courses` table (managed from
-// Admin Panel → Courses). Falls back to the static catalog in @/lib/courses
-// when the DB is unreachable or the table has no rows yet.
+// Admin Panel → Courses). No static fallback — when the DB has no rows (or is
+// unreachable) the public site shows nothing, never placeholder templates.
 
 /** True when a course is visible on the public site (published, not hidden). */
 export function isCoursePublished(
@@ -111,7 +110,7 @@ function toCourse(
     name: row.name,
     category: row.category,
     batchId: row.batchId,
-    image: row.image ?? "/courses/biology.svg",
+    image: row.image ?? "",
     shortDescription: row.shortDescription ?? "",
     description: row.description ?? "",
     teacherName: row.teacherName,
@@ -135,7 +134,7 @@ function toCourse(
   };
 }
 
-/** All live courses — DB rows when available, static catalog otherwise. */
+/** All live courses — DB rows only. Empty when no courses are added. */
 export async function getLiveCourses(): Promise<Course[]> {
   try {
     const rows = await fetchCatalogCourses();
@@ -144,9 +143,9 @@ export async function getLiveCourses(): Promise<Course[]> {
       return rows.map((row) => toCourse(row, counts));
     }
   } catch {
-    // fall through to static
+    // DB unreachable — show nothing, never placeholder templates.
   }
-  return staticCourses;
+  return [];
 }
 
 /** Published + available courses for the public site. */
@@ -168,9 +167,9 @@ export async function getLiveCourse(
       return toCourse(row, counts);
     }
   } catch {
-    // fall through to static
+    // DB unreachable — no course to show.
   }
-  return staticCourses.find((course) => course.slug === key);
+  return undefined;
 }
 
 /** Latest-batch featured courses (mirrors getFeaturedCourses). */
@@ -213,24 +212,8 @@ export async function fetchCourseCategoryCounts(): Promise<Record<string, number
       rows = [];
     }
 
-    // If DB has no rows, fall back to static catalog counts via name mapping.
+    // If DB has no rows, every category stays at 0 — no placeholder counts.
     if (rows.length === 0) {
-      const publicCourses = await getLivePublicCourses();
-      for (const course of publicCourses) {
-        const token = course.category.toLowerCase().replace(/[^a-z0-9]+/g, "");
-        // Try direct name token match, then slug prefix.
-        let targetId: string | undefined;
-        if (nameTokenToId.has(token)) targetId = nameTokenToId.get(token);
-        else {
-          for (const [slug, id] of slugToId) {
-            if (token.startsWith(slug) || slug.startsWith(token.slice(0, 3))) {
-              targetId = id;
-              break;
-            }
-          }
-        }
-        if (targetId && counts[targetId] !== undefined) counts[targetId] += 1;
-      }
       return counts;
     }
 

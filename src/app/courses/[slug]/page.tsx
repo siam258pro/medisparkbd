@@ -71,14 +71,16 @@ export default async function CourseDetailsPage({
         <div className="mt-6 overflow-hidden rounded-2xl border border-ink/10 bg-dark-900 shadow-lg shadow-black/20">
           {/* Banner with category (top-left) + batch (top-right) overlays */}
           <div className="relative aspect-[16/10] overflow-hidden">
-            <Image
-              src={course.image}
-              alt={course.name}
-              fill
-              priority
-              sizes="(min-width: 1024px) 55vw, 100vw"
-              className="object-cover"
-            />
+            {course.image ? (
+              <Image
+                src={course.image}
+                alt={course.name}
+                fill
+                priority
+                sizes="(min-width: 1024px) 55vw, 100vw"
+                className="object-cover"
+              />
+            ) : null}
             <div className="absolute inset-0 bg-gradient-to-t from-dark-950/70 via-dark-950/10 to-dark-950/30" />
             {course.category && (
               <span className="absolute left-4 top-4 max-w-[55%] truncate rounded-lg border border-primary-500/40 bg-dark-950/80 px-3 py-1.5 text-xs font-bold text-primary-400 backdrop-blur">

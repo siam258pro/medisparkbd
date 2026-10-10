@@ -1,5 +1,4 @@
 import { exec, query } from "@/lib/mysql";
-import { getFeaturedCourses } from "@/lib/courses";
 import { revalidatePath, revalidateTag } from "next/cache";
 
 // Featured Course system — SINGLE SOURCE OF TRUTH:
@@ -52,13 +51,6 @@ async function migrateLegacySelection(): Promise<void> {
   }
 }
 
-function defaultSlugs(): string[] {
-  // No admin selection yet and no DB — keep the "latest batch" behaviour.
-  return getFeaturedCourses()
-    .slice(0, 2)
-    .map((course) => course.slug);
-}
-
 /** All featured records (flag on), ordered — Admin Panel list. */
 export async function fetchAllFeaturedCourses(): Promise<
   FeaturedCourseRecord[]
@@ -72,11 +64,8 @@ export async function fetchAllFeaturedCourses(): Promise<
     );
     return rows.map((row) => ({ courseSlug: row.slug, isActive: true }));
   } catch {
-    // DB unreachable only — never fake a selection when the admin
-    // deliberately has no featured courses.
-    return getFeaturedCourses()
-      .slice(0, 2)
-      .map((course) => ({ courseSlug: course.slug, isActive: true }));
+    // DB unreachable and no selection — show nothing, never placeholders.
+    return [];
   }
 }
 
@@ -95,8 +84,8 @@ export async function fetchActiveFeaturedSlugs(): Promise<string[]> {
     );
     return rows.map((row) => row.slug);
   } catch {
-    // DB unreachable only — fall back to the static catalog.
-    return defaultSlugs();
+    // DB unreachable — show nothing, never placeholders.
+    return [];
   }
 }
 

@@ -9,7 +9,7 @@ import {
   findPendingApplication,
   APPLICATION_PENDING,
 } from "@/lib/enrollment-applications";
-import { getCourse, getPayableFee } from "@/lib/courses";
+import { getPayableFee } from "@/lib/courses";
 import { getLiveCourse } from "@/lib/course-catalog";
 import {
   BD_PHONE_MESSAGE,
@@ -117,9 +117,7 @@ export async function POST(request: NextRequest) {
   // every direct query in this route below uses { cache: false } so each
   // enrollment attempt validates against fresh data.
   const serverCourse =
-    ((await getLiveCourse(courseId).catch(() => undefined)) ??
-      getCourse(courseId)) ||
-    null;
+    (await getLiveCourse(courseId).catch(() => undefined)) || null;
   if (!serverCourse) {
     return NextResponse.json({ error: "Unknown course." }, { status: 400 });
   }

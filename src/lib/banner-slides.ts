@@ -25,6 +25,7 @@ async function fetchBannerSlidesRaw(): Promise<BannerSlide[]> {
 
     for (const course of courses) {
       const payable = getPayableFee(course);
+      if (!course.image) continue;
       slides.push({
         id: `featured-${course.slug}`,
         image: course.image,

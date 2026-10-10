@@ -29,13 +29,15 @@ export default function CourseCard({ course }: { course: Course }) {
     <article className="group flex flex-col overflow-hidden rounded-2xl border border-ink/10 bg-dark-900 shadow-lg shadow-black/20 transition duration-300 hover:-translate-y-1 hover:border-primary-600/60 hover:shadow-primary-900/30">
       {/* Image area with dynamic category (left) + batch (right) labels */}
       <div className="relative aspect-[16/10] overflow-hidden">
-        <Image
-          src={course.image}
-          alt={course.name}
-          fill
-          sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
-          className="object-cover transition duration-500 group-hover:scale-105"
-        />
+        {course.image ? (
+          <Image
+            src={course.image}
+            alt={course.name}
+            fill
+            sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
+            className="object-cover transition duration-500 group-hover:scale-105"
+          />
+        ) : null}
         <div className="absolute inset-0 bg-gradient-to-t from-dark-950/70 via-dark-950/10 to-dark-950/30" />
         {categoryLabel && (
           <span className="absolute left-3 top-3 max-w-[55%] truncate rounded-lg border border-primary-500/40 bg-dark-950/80 px-2.5 py-1 text-[11px] font-bold text-primary-400 backdrop-blur">
