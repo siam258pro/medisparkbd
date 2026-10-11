@@ -11,7 +11,7 @@ import { groupStrokes, pointInPolygon } from './grouping.ts';
 import { detectInkShape } from './inkShape.ts';
 import { groupIntoLines } from './lines.ts';
 import { expandCoalesced, shouldIgnorePointer } from './input.ts';
-import { VisionLlmRecognizer, type RecResult } from './recognizer.ts';
+import { VisionLlmRecognizer, type RecResult, verifyLang, normalizeBanglaNFC, type RecLang } from './recognizer.ts';
 import type { TextLine } from './lines.ts';
 import { pickFont, ensureFonts, fitFontSize, measureCanvas } from './handText.ts';
 import { loadBoards, saveBoards, loadProfile, saveProfile } from './storage.ts';
@@ -106,6 +106,8 @@ export default function Whiteboard() {
   const [palmReject, setPalmReject] = useState(true);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [aiBusy, setAiBusy] = useState(0);
+  const [aiNotice, setAiNotice] = useState(false);
+  const [chips, setChips] = useState<Array<{ key: string; ids: string[]; text: string; alternatives: string[]; lang: RecLang; sx: number; sy: number }>>([]);
   const [recMode, setRecMode] = useState<'clean' | 'convert'>('clean');
   const LOW_CONF = 0.6;
   const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky'; editId?: string }>(null);
@@ -144,6 +146,16 @@ export default function Whiteboard() {
     try { return loadProfile(); } catch { return DEFAULT_PROFILE; }
   }
 
+  const SETTINGS_KEY = 'msb.hwsettings.v1';
+  const NOTICE_KEY = 'msb.aiNotice.v1';
+
+  // Persist handwriting settings (never the strokes or the API key).
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ aiEnabled, recMode, inkStyle, hwMode, palmReject }));
+    } catch { /* ignore */ }
+  }, [aiEnabled, recMode, inkStyle, hwMode, palmReject]);
+
   const board = boards.find((b) => b.id === boardId);
   const rerender = () => setTick((t) => t + 1);
 
@@ -164,6 +176,20 @@ export default function Whiteboard() {
     bgRef.current = bs[0].background ?? { type: 'dots' };
     pdfRef.current = bs[0].pdf ?? null;
     try { setMemCount(loadProfile().examples.length); } catch { /* ignore */ }
+    try {
+      const raw = window.localStorage.getItem(SETTINGS_KEY);
+      if (raw) {
+        const s = JSON.parse(raw) as Partial<Record<string, unknown>>;
+        if (typeof s.hwMode === 'boolean') setHwMode(s.hwMode);
+        if (typeof s.palmReject === 'boolean') setPalmReject(s.palmReject);
+        if (s.inkStyle === 'geometric' || s.inkStyle === 'clean') setInkStyle(s.inkStyle);
+        if (s.recMode === 'clean' || s.recMode === 'convert') setRecMode(s.recMode);
+        if (s.aiEnabled === true) {
+          setAiEnabled(true);
+          if (!window.localStorage.getItem(NOTICE_KEY)) setAiNotice(true);
+        }
+      }
+    } catch { /* ignore */ }
     void ensureFonts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -566,7 +592,17 @@ export default function Whiteboard() {
         const result = await recognizerRef.current.recognize(strokes);
         recRef.current.set(ids.join(','), { line, result });
         if (result.confidence < LOW_CONF) {
-          setStatus(`Low confidence (${Math.round(result.confidence * 100)}%) — kept ink. Best guess: "${result.text.slice(0, 60)}". Alternatives picker lands in Phase 5.`);
+          const canvas = canvasRef.current;
+          const cam = camRef.current;
+          const lb = line.bbox;
+          const cx = canvas ? ((lb.x + lb.w / 2 - cam.x) * cam.zoom + canvas.clientWidth / 2) : 100;
+          const ty = canvas ? ((lb.y - cam.y) * cam.zoom + canvas.clientHeight / 2) : 100;
+          const key = ids.join(',');
+          setChips((prev) => [...prev.slice(-4), {
+            key, ids, text: result.text, alternatives: result.alternatives,
+            lang: result.lang, sx: cx, sy: ty,
+          }]);
+          setStatus(`Low confidence (${Math.round(result.confidence * 100)}%) — pick a transcription from the chips, or keep the ink.`);
         } else if (recMode === 'convert') {
           await convertLineToText(strokes, result);
         } else {
@@ -597,6 +633,29 @@ export default function Whiteboard() {
   const beautifyOrRecognize = () => {
     if (hwMode && selectedRef.current.size > 0) recognizeIds([...selectedRef.current]);
     else runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined);
+  };
+
+  /** AI toggle with explicit privacy notice on first enable. */
+  const toggleAi = (v: boolean) => {
+    setAiEnabled(v);
+    if (v) {
+      try {
+        if (!window.localStorage.getItem(NOTICE_KEY)) setAiNotice(true);
+      } catch {
+        setAiNotice(true);
+      }
+    }
+  };
+
+  /** Apply a user's chip choice as the transcription (low-confidence flow). */
+  const applyChip = (chip: { key: string; ids: string[]; lang: RecLang }, text: string) => {
+    const strokes = chip.ids
+      .map((id) => strokesRef.current.find((s) => s.id === id))
+      .filter((s): s is Stroke => !!s);
+    setChips((prev) => prev.filter((c) => c.key !== chip.key));
+    if (!strokes.length) { setStatus('Original strokes are gone — chip dismissed.'); return; }
+    const clean = normalizeBanglaNFC(text);
+    void convertLineToText(strokes, { text: clean, lang: verifyLang(clean, chip.lang), confidence: 1, alternatives: [] });
   };
 
   /** Group handwritten strokes after pause, then recognize each line (Phase 3). */
@@ -1268,6 +1327,7 @@ export default function Whiteboard() {
     pdfRef.current = b.pdf ?? null;
     moveRef.current = null;
     setEditing(null);
+    setChips([]);
     selectedRef.current.clear();
     undoRef.current = []; redoRef.current = [];
     setBoardId(id);
@@ -1564,7 +1624,11 @@ export default function Whiteboard() {
 
           <DockSection title="Beautify" icon={ICONS.spark} defaultOpen>
             <Toggle label="Auto Beautify" hint="Process after pause" checked={autoBeautify} onChange={setAutoBeautify} />
-            <Toggle label="Use AI to recognize handwriting" hint="Sends stroke images to your /api/recognize backend" checked={aiEnabled} onChange={setAiEnabled} />
+            <Toggle label="Use AI to recognize handwriting" hint="Sends stroke images to your /api/recognize backend" checked={aiEnabled} onChange={toggleAi} />
+            <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
+              When on, PNG images of your handwriting are POSTed to your own backend,
+              which forwards them to a vision AI service. Nothing is sent while off.
+            </p>
             {aiEnabled && (
               <>
                 <label className="mt-2 block text-xs text-neutral-400">When recognized</label>
@@ -1765,6 +1829,34 @@ export default function Whiteboard() {
         </aside>
       )}
 
+      {/* ── AI privacy notice (first enable) ──────────────── */}
+      {aiNotice && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-neutral-900 p-5 shadow-2xl">
+            <h2 className="text-sm font-semibold text-neutral-100">Handwriting recognition uses AI</h2>
+            <p className="mt-2 text-xs leading-relaxed text-neutral-300">
+              When enabled, images of the strokes you write in Handwriting mode are sent
+              to <code className="text-amber-300">/api/recognize</code> on your own backend, which
+              forwards them to a vision AI service for transcription. Your API key stays
+              on the backend and is never in this app. Turn the setting off any time to
+              stop sending strokes.
+            </p>
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={() => { try { window.localStorage.setItem(NOTICE_KEY, '1'); } catch { /* ignore */ } setAiNotice(false); }}
+                className="flex-1 rounded-lg bg-amber-400 px-3 py-2 text-xs font-semibold text-neutral-950 transition hover:brightness-110 active:scale-95">
+                I understand, keep on
+              </button>
+              <button
+                onClick={() => { setAiEnabled(false); setAiNotice(false); }}
+                className="flex-1 rounded-lg border border-white/15 px-3 py-2 text-xs text-neutral-300 transition hover:bg-white/5 active:scale-95">
+                Turn off
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Floating selection toolbar ────────────────────── */}
       {selBox && !editing && (
         <div className="absolute z-20 flex items-center gap-1 rounded-2xl border border-white/10 bg-neutral-900/90 p-1.5 shadow-xl backdrop-blur-md"
@@ -1776,6 +1868,33 @@ export default function Whiteboard() {
           <button onClick={deleteSelected} title="Delete (Del)" className={`${miniBtn} !border-red-400/50 !text-red-300`}>Delete</button>
         </div>
       )}
+
+      {/* ── Low-confidence transcription chips ────────────── */}
+      {chips.map((c) => (
+        <div
+          key={c.key}
+          className="absolute z-20 w-60 rounded-2xl border border-amber-400/40 bg-neutral-900/95 p-2.5 shadow-xl backdrop-blur-md"
+          style={{
+            left: Math.max(8, Math.min(c.sx - 120, (wrapRef.current?.clientWidth ?? 400) - 260)),
+            top: Math.max(64, c.sy - 12),
+          }}
+        >
+          <p className="mb-1.5 text-[11px] font-medium text-neutral-400">Not sure — tap to use:</p>
+          <div className="flex flex-wrap gap-1.5">
+            {[c.text, ...c.alternatives].filter(Boolean).slice(0, 4).map((alt, i) => (
+              <button
+                key={i}
+                onClick={() => applyChip(c, alt)}
+                className={`rounded-lg border px-2 py-1 text-xs transition active:scale-95 ${i === 0 ? 'border-amber-400 bg-amber-400/15 text-amber-200' : 'border-white/10 text-neutral-300 hover:bg-white/5'}`}
+              >
+                {alt.length > 40 ? alt.slice(0, 40) + '…' : alt}
+              </button>
+            ))}
+            <button onClick={() => setChips((prev) => prev.filter((x) => x.key !== c.key))} title="Keep ink, dismiss"
+              className="rounded-lg border border-white/10 px-2 py-1 text-xs text-neutral-500 hover:bg-white/5">Keep ink</button>
+          </div>
+        </div>
+      ))}
 
       {/* ── Bottom-center: status + zoom pill ─────────────────── */}
       <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-neutral-900/85 py-1.5 pl-4 pr-1.5 shadow-xl backdrop-blur-md">
