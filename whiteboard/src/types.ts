@@ -25,6 +25,10 @@ export interface Stroke {
   color: string;
   width: number;
   tool: 'pen' | 'highlighter' | 'line' | 'arrow' | 'rect' | 'ellipse';
+  /** handwriting-style font css for converted text strokes */
+  font?: string;
+  /** original stroke ids replaced by a converted text object */
+  replaces?: string[];
   /** render with variable-width (perfect-freehand) outline */
   variableWidth?: boolean;
   /** true when drawn in Handwriting mode (recognition candidate) */

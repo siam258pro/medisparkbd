@@ -13,6 +13,7 @@ import { groupIntoLines } from './lines.ts';
 import { expandCoalesced, shouldIgnorePointer } from './input.ts';
 import { VisionLlmRecognizer, type RecResult } from './recognizer.ts';
 import type { TextLine } from './lines.ts';
+import { pickFont, ensureFonts, fitFontSize, measureCanvas } from './handText.ts';
 import { loadBoards, saveBoards, loadProfile, saveProfile } from './storage.ts';
 import { DEFAULT_PROFILE, learnFromFeedback, deleteExample, clearMemory, countByScript, exportProfile, importProfile } from './memory.ts';
 
@@ -105,7 +106,9 @@ export default function Whiteboard() {
   const [palmReject, setPalmReject] = useState(true);
   const [aiEnabled, setAiEnabled] = useState(false);
   const [aiBusy, setAiBusy] = useState(0);
-  const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky' }>(null);
+  const [recMode, setRecMode] = useState<'clean' | 'convert'>('clean');
+  const LOW_CONF = 0.6;
+  const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky'; editId?: string }>(null);
   const [editText, setEditText] = useState('');
   const [boardNameDraft, setBoardNameDraft] = useState('');
   const [renameDraft, setRenameDraft] = useState('');
@@ -161,6 +164,7 @@ export default function Whiteboard() {
     bgRef.current = bs[0].background ?? { type: 'dots' };
     pdfRef.current = bs[0].pdf ?? null;
     try { setMemCount(loadProfile().examples.length); } catch { /* ignore */ }
+    void ensureFonts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -270,7 +274,8 @@ export default function Whiteboard() {
       }
       if (s.text !== undefined) {
         ctx.fillStyle = s.color;
-        ctx.font = `${Math.max(10, (s.width * 6) * cam.zoom)}px "Noto Sans Bengali","Noto Sans",sans-serif`;
+        const family = s.font ?? pickFont(s.text);
+        ctx.font = `${Math.max(10, (s.width * 6) * cam.zoom)}px ${family}`;
         ctx.fillText(s.text, X(pts[0]?.x ?? 0), Y(pts[0]?.y ?? 0));
         return;
       }
@@ -523,6 +528,77 @@ export default function Whiteboard() {
     }, 0);
   }, [lang, strength, inkStyle, persist]);
 
+  /** Replace a recognized line's ink with an editable text object (undo-safe). */
+  const convertLineToText = useCallback(async (strokes: Stroke[], result: RecResult) => {
+    await ensureFonts();
+    pushUndo();
+    const ids = new Set(strokes.map((s) => s.id));
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of strokes) for (const p of (s.originalPoints ?? s.points)) {
+      x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
+    }
+    if (!isFinite(x0)) return;
+    const font = pickFont(result.text);
+    const startPx = Math.max(14, Math.min(110, (y1 - y0) * 0.9));
+    const px = fitFontSize(result.text, font, Math.max(40, (x1 - x0) * 1.05), startPx, measureCanvas);
+    const textStroke: Stroke = {
+      id: uid('t'), points: [{ x: x0, y: y0, t: Date.now() }],
+      color: strokes[0]?.color ?? '#f5f2ea', width: px / 6, tool: 'pen',
+      font, text: result.text, replaces: [...ids], handwritten: true, createdAt: Date.now(),
+    };
+    strokesRef.current = [...strokesRef.current.filter((s) => !ids.has(s.id)), textStroke];
+    persist(strokesRef.current, camRef.current);
+    rerender();
+    setStatus(`Converted to text: "${result.text.slice(0, 60)}" — double-click to edit, undo restores ink.`);
+  }, [persist, pushUndo]);
+
+  /** Recognize grouped lines and apply recMode (clean or convert). */
+  const recognizeLines = useCallback(async (lines: TextLine[], byId: Map<string, Stroke>) => {
+    let n = 0;
+    for (const line of lines) {
+      const ids = line.words.flatMap((w) => w.strokeIds);
+      const strokes = ids.map((id) => byId.get(id)).filter((s): s is Stroke => !!s);
+      if (!strokes.length) continue;
+      n++;
+      setAiBusy((b) => b + 1);
+      setStatus(`Sending strokes to AI service… (line ${n}/${lines.length})`);
+      try {
+        const result = await recognizerRef.current.recognize(strokes);
+        recRef.current.set(ids.join(','), { line, result });
+        if (result.confidence < LOW_CONF) {
+          setStatus(`Low confidence (${Math.round(result.confidence * 100)}%) — kept ink. Best guess: "${result.text.slice(0, 60)}". Alternatives picker lands in Phase 5.`);
+        } else if (recMode === 'convert') {
+          await convertLineToText(strokes, result);
+        } else {
+          pushUndo();
+          const idSet = new Set(ids);
+          strokesRef.current = strokesRef.current.map((s) => (idSet.has(s.id) ? cleanStroke(s) : s));
+          persist(strokesRef.current, camRef.current);
+          rerender();
+          setStatus(`Recognized "${result.text.slice(0, 60)}" (${result.lang}) — cleaned strokes.`);
+        }
+      } catch (e) {
+        setStatus(`Recognition failed: ${(e as Error).message}`);
+      } finally {
+        setAiBusy((b) => Math.max(0, b - 1));
+      }
+    }
+  }, [recMode, convertLineToText, persist, pushUndo]);
+
+  /** Manual mode: recognize the current lasso selection. */
+  const recognizeIds = (ids: string[]) => {
+    const sel = strokesRef.current.filter((s) => ids.includes(s.id) && s.tool === 'pen');
+    if (!sel.length) { setStatus('Select handwritten pen strokes first.'); return; }
+    const lines = groupIntoLines(sel, { pauseMs: 700 });
+    void recognizeLines(lines, new Map(sel.map((s) => [s.id, s])));
+  };
+
+  /** Beautify buttons route to recognition in Handwriting mode with a selection. */
+  const beautifyOrRecognize = () => {
+    if (hwMode && selectedRef.current.size > 0) recognizeIds([...selectedRef.current]);
+    else runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined);
+  };
+
   /** Group handwritten strokes after pause, then recognize each line (Phase 3). */
   const queueHwRecognition = useCallback(() => {
     if (hwTimerRef.current) clearTimeout(hwTimerRef.current);
@@ -537,26 +613,9 @@ export default function Whiteboard() {
         return;
       }
       const byId = new Map(pending.map((s) => [s.id, s]));
-      let n = 0;
-      for (const line of lines) {
-        const ids = line.words.flatMap((w) => w.strokeIds);
-        const strokes = ids.map((id) => byId.get(id)).filter((s): s is Stroke => !!s);
-        if (!strokes.length) continue;
-        n++;
-        setAiBusy((b) => b + 1);
-        setStatus(`Sending strokes to AI service… (line ${n}/${lines.length})`);
-        try {
-          const result = await recognizerRef.current.recognize(strokes);
-          recRef.current.set(ids.join(','), { line, result });
-          setStatus(`Recognized: "${result.text.slice(0, 60)}" (${result.lang}, ${(result.confidence * 100) | 0}%) — convert mode lands in Phase 4.`);
-        } catch (e) {
-          setStatus(`Recognition failed: ${(e as Error).message}`);
-        } finally {
-          setAiBusy((b) => Math.max(0, b - 1));
-        }
-      }
+      void recognizeLines(lines, byId);
     }, 700);
-  }, [aiEnabled]);
+  }, [aiEnabled, recMode, recognizeLines]);
 
   const scheduleAuto = useCallback(() => {
     if (!autoBeautify) return;
@@ -749,6 +808,21 @@ export default function Whiteboard() {
     const ed = editing;
     if (!ed) return;
     const txt = editText.trim();
+    if (ed.editId) {
+      // Editing an existing converted text object (double-click flow).
+      pushUndo();
+      if (!txt) {
+        strokesRef.current = strokesRef.current.filter((s) => s.id !== ed.editId);
+        setStatus('Text deleted.');
+      } else {
+        strokesRef.current = strokesRef.current.map((s) => s.id === ed.editId ? { ...s, text: txt } : s);
+        setStatus('Text updated.');
+      }
+      persist(strokesRef.current, camRef.current);
+      setEditing(null);
+      rerender();
+      return;
+    }
     if (txt) {
       pushUndo();
       strokesRef.current = [...strokesRef.current, {
@@ -1024,8 +1098,23 @@ export default function Whiteboard() {
     if (hwMode && strokeTool === 'pen' && !isShapeTool) queueHwRecognition();
   };
 
-  const onWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    const cam = camRef.current;
+  const onDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const wpt = toWorld(e.clientX, e.clientY);
+    const hit = hitStroke(wpt.x, wpt.y);
+    if (hit && hit.text !== undefined && !hit.isImage && hit.points[0]) {
+      const root = wrapRef.current?.getBoundingClientRect();
+      setEditing({
+        wx: hit.points[0].x, wy: hit.points[0].y,
+        sx: root ? e.clientX - root.left : e.clientX,
+        sy: root ? e.clientY - root.top : e.clientY,
+        kind: 'text', editId: hit.id,
+      });
+      setEditText(hit.text);
+      setStatus('Editing text — Enter saves, Esc cancels, empty deletes.');
+    }
+  };
+
+  const onWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {    const cam = camRef.current;
     const factor = Math.exp(-e.deltaY * 0.0012);
     camRef.current = { ...cam, zoom: Math.max(0.15, Math.min(6, cam.zoom * factor)) };
     rerender();
@@ -1326,6 +1415,7 @@ export default function Whiteboard() {
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
+        onDoubleClick={onDoubleClick}
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
@@ -1369,7 +1459,7 @@ export default function Whiteboard() {
           className="rounded-2xl border border-white/10 bg-neutral-900/80 p-2.5 text-amber-300 shadow-xl backdrop-blur-md transition hover:bg-white/10 active:scale-95">
           <Icon d={theme === 'night' ? ICONS.sun : ICONS.moon} />
         </button>
-        <button onClick={() => runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined)}
+        <button onClick={beautifyOrRecognize}
           title="Beautify now"
           className="flex items-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 px-4 py-2 text-sm font-semibold text-neutral-950 shadow-xl transition hover:brightness-110 active:scale-95">
           <Icon d={ICONS.spark} size={16} />
@@ -1475,6 +1565,19 @@ export default function Whiteboard() {
           <DockSection title="Beautify" icon={ICONS.spark} defaultOpen>
             <Toggle label="Auto Beautify" hint="Process after pause" checked={autoBeautify} onChange={setAutoBeautify} />
             <Toggle label="Use AI to recognize handwriting" hint="Sends stroke images to your /api/recognize backend" checked={aiEnabled} onChange={setAiEnabled} />
+            {aiEnabled && (
+              <>
+                <label className="mt-2 block text-xs text-neutral-400">When recognized</label>
+                <div className="mt-1 grid grid-cols-2 gap-1.5">
+                  {(['clean', 'convert'] as const).map((m) => (
+                    <button key={m} onClick={() => setRecMode(m)}
+                      className={`rounded-lg border py-1.5 text-xs capitalize transition active:scale-95 ${recMode === m ? 'border-sky-400 bg-sky-400/15 text-sky-200' : 'border-white/10 text-neutral-400 hover:bg-white/5'}`}>
+                      {m === 'convert' ? 'Convert to text' : 'Clean strokes'}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             {aiBusy > 0 && <p className="mt-1 text-[11px] text-amber-300">Recognizing handwriting… ({aiBusy})</p>}
             <label className="mt-2 block text-xs text-neutral-400">Ink style</label>
             <div className="mt-1 grid grid-cols-2 gap-1.5">
@@ -1507,7 +1610,7 @@ export default function Whiteboard() {
             <Toggle label="Compare original" hint="Show raw ink" checked={showOriginal} onChange={setShowOriginal} />
             <Toggle label="Ghost original under" hint="Faint raw layer" checked={keepOriginalUnder} onChange={setKeepOriginalUnder} />
             <div className="mt-2 flex gap-1.5">
-              <button onClick={() => runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined)} className={`${miniBtn} flex-1 !border-amber-400/50 !text-amber-200`}>Beautify now</button>
+              <button onClick={beautifyOrRecognize} className={`${miniBtn} flex-1 !border-amber-400/50 !text-amber-200`}>Beautify now</button>
               <button onClick={revertSelected} className={`${miniBtn} flex-1`}>Revert</button>
             </div>
             <p className="mt-2 text-[11px] leading-relaxed text-neutral-500">
@@ -1669,7 +1772,7 @@ export default function Whiteboard() {
           <span className="px-1.5 text-[11px] font-semibold text-sky-300">{selectedRef.current.size} selected</span>
           <button onClick={duplicateSelected} title="Duplicate selection" className={miniBtn}>Duplicate</button>
           <button onClick={copySelected} title="Copy (Ctrl+C)" className={miniBtn}>Copy</button>
-          <button onClick={() => runBeautify([...selectedRef.current])} title="Beautify selection" className={`${miniBtn} !border-amber-400/50 !text-amber-200`}>Beautify</button>
+          <button onClick={beautifyOrRecognize} title="Beautify selection" className={`${miniBtn} !border-amber-400/50 !text-amber-200`}>Beautify</button>
           <button onClick={deleteSelected} title="Delete (Del)" className={`${miniBtn} !border-red-400/50 !text-red-300`}>Delete</button>
         </div>
       )}
