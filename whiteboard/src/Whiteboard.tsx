@@ -11,6 +11,8 @@ import { groupStrokes, pointInPolygon } from './grouping.ts';
 import { detectInkShape } from './inkShape.ts';
 import { groupIntoLines } from './lines.ts';
 import { expandCoalesced, shouldIgnorePointer } from './input.ts';
+import { VisionLlmRecognizer, type RecResult } from './recognizer.ts';
+import type { TextLine } from './lines.ts';
 import { loadBoards, saveBoards, loadProfile, saveProfile } from './storage.ts';
 import { DEFAULT_PROFILE, learnFromFeedback, deleteExample, clearMemory, countByScript, exportProfile, importProfile } from './memory.ts';
 
@@ -101,6 +103,8 @@ export default function Whiteboard() {
   const [autoShape, setAutoShape] = useState(true);
   const [hwMode, setHwMode] = useState(false);
   const [palmReject, setPalmReject] = useState(true);
+  const [aiEnabled, setAiEnabled] = useState(false);
+  const [aiBusy, setAiBusy] = useState(0);
   const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky' }>(null);
   const [editText, setEditText] = useState('');
   const [boardNameDraft, setBoardNameDraft] = useState('');
@@ -127,6 +131,8 @@ export default function Whiteboard() {
   const hwTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const processedHwRef = useRef<Set<string>>(new Set());
   const penActiveRef = useRef(0);
+  const recognizerRef = useRef(new VisionLlmRecognizer());
+  const recRef = useRef(new Map<string, { line: TextLine; result: RecResult }>());
   const profileRef = useRef(loadProfileSafe());
   const [memCount, setMemCount] = useState(0);
   const spaceDown = useRef(false);
@@ -517,19 +523,40 @@ export default function Whiteboard() {
     }, 0);
   }, [lang, strength, inkStyle, persist]);
 
-  /** Phase 1 stub: group handwritten strokes into lines/words after pause.
-   *  Phase 3 replaces the status-only tail with real recognition. */
+  /** Group handwritten strokes after pause, then recognize each line (Phase 3). */
   const queueHwRecognition = useCallback(() => {
     if (hwTimerRef.current) clearTimeout(hwTimerRef.current);
-    hwTimerRef.current = setTimeout(() => {
+    hwTimerRef.current = setTimeout(async () => {
       const pending = strokesRef.current.filter((s) => s.handwritten && s.tool === 'pen' && !s.beautified && !processedHwRef.current.has(s.id));
       if (!pending.length) return;
       const lines = groupIntoLines(pending, { pauseMs: 700 });
       const words = lines.reduce((a, l) => a + l.words.length, 0);
       for (const l of lines) for (const w of l.words) for (const id of w.strokeIds) processedHwRef.current.add(id);
-      setStatus(`Handwriting: ${lines.length} line(s), ${words} word(s) grouped — recognizer lands in Phase 3.`);
+      if (!aiEnabled) {
+        setStatus(`Handwriting: ${lines.length} line(s), ${words} word(s) grouped — enable "Use AI" to recognize.`);
+        return;
+      }
+      const byId = new Map(pending.map((s) => [s.id, s]));
+      let n = 0;
+      for (const line of lines) {
+        const ids = line.words.flatMap((w) => w.strokeIds);
+        const strokes = ids.map((id) => byId.get(id)).filter((s): s is Stroke => !!s);
+        if (!strokes.length) continue;
+        n++;
+        setAiBusy((b) => b + 1);
+        setStatus(`Sending strokes to AI service… (line ${n}/${lines.length})`);
+        try {
+          const result = await recognizerRef.current.recognize(strokes);
+          recRef.current.set(ids.join(','), { line, result });
+          setStatus(`Recognized: "${result.text.slice(0, 60)}" (${result.lang}, ${(result.confidence * 100) | 0}%) — convert mode lands in Phase 4.`);
+        } catch (e) {
+          setStatus(`Recognition failed: ${(e as Error).message}`);
+        } finally {
+          setAiBusy((b) => Math.max(0, b - 1));
+        }
+      }
     }, 700);
-  }, []);
+  }, [aiEnabled]);
 
   const scheduleAuto = useCallback(() => {
     if (!autoBeautify) return;
@@ -1447,6 +1474,8 @@ export default function Whiteboard() {
 
           <DockSection title="Beautify" icon={ICONS.spark} defaultOpen>
             <Toggle label="Auto Beautify" hint="Process after pause" checked={autoBeautify} onChange={setAutoBeautify} />
+            <Toggle label="Use AI to recognize handwriting" hint="Sends stroke images to your /api/recognize backend" checked={aiEnabled} onChange={setAiEnabled} />
+            {aiBusy > 0 && <p className="mt-1 text-[11px] text-amber-300">Recognizing handwriting… ({aiBusy})</p>}
             <label className="mt-2 block text-xs text-neutral-400">Ink style</label>
             <div className="mt-1 grid grid-cols-2 gap-1.5">
               {(['geometric', 'clean'] as const).map((m) => (
