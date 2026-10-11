@@ -631,14 +631,38 @@ export default function Whiteboard() {
 
   /** Beautify buttons route to recognition in Handwriting mode with a selection. */
   const beautifyOrRecognize = () => {
-    if (hwMode && selectedRef.current.size > 0) recognizeIds([...selectedRef.current]);
-    else runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined);
+    if (hwMode) {
+      if (selectedRef.current.size > 0) {
+        recognizeIds([...selectedRef.current]);
+        return;
+      }
+      const pending = strokesRef.current.filter((s) => s.handwritten && s.tool === 'pen' && !s.beautified);
+      if (!pending.length) { setStatus('No handwritten ink to recognize — write in Handwriting mode first.'); return; }
+      if (!aiEnabled) { setStatus('Enable "Use AI" to recognize this ink (geometric fallback: switch ink style).'); return; }
+      const lines = groupIntoLines(pending, { pauseMs: 700 });
+      void recognizeLines(lines, new Map(pending.map((s) => [s.id, s])));
+      return;
+    }
+    runBeautify(selectedRef.current.size ? [...selectedRef.current] : undefined);
   };
 
   /** AI toggle with explicit privacy notice on first enable. */
   const toggleAi = (v: boolean) => {
     setAiEnabled(v);
     if (v) {
+      processedHwRef.current.clear(); // re-queue existing handwritten ink
+      void fetch('/api/health', { signal: AbortSignal.timeout(5000) })
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const h = (await r.json()) as { configured?: boolean };
+          if (!h.configured) {
+            setStatus('AI on, but the backend has no LLM_API_KEY — set it in whiteboard/.env and restart `npm run server`.');
+          } else {
+            setStatus('AI on — write in Handwriting mode.');
+            queueHwRecognition();
+          }
+        })
+        .catch(() => setStatus('AI on, but the backend is unreachable — start it first: `npm run server` (port 3001).'));
       try {
         if (!window.localStorage.getItem(NOTICE_KEY)) setAiNotice(true);
       } catch {
@@ -1128,8 +1152,10 @@ export default function Whiteboard() {
       pts = shapePoints(tool, a, b);
     }
     const strokeTool = tool === 'highlighter' ? 'highlighter' : isShapeTool ? tool : 'pen';
+    const isHwStroke = hwMode && !isShapeTool && tool === 'pen';
     // Ink-to-shape: deliberately-drawn rough shapes become perfect geometry.
-    if (!isShapeTool && tool === 'pen' && autoShape) {
+    // Skipped in Handwriting mode — those strokes belong to recognition.
+    if (!isShapeTool && tool === 'pen' && autoShape && !hwMode) {
       const found = detectInkShape(pts);
       if (found) {
         const a = { x: found.ax, y: found.ay, t: Date.now() }, b = { x: found.bx, y: found.by, t: Date.now() };
@@ -1152,9 +1178,15 @@ export default function Whiteboard() {
     }];
     persist(strokesRef.current, camRef.current);
     rerender();
-    if (autoBeautify && strokeTool === 'pen') scheduleAuto();
-    else if (!autoBeautify) setStatus('Stroke saved (Auto Beautify off).');
-    if (hwMode && strokeTool === 'pen' && !isShapeTool) queueHwRecognition();
+    if (isHwStroke && aiEnabled) {
+      // Recognition owns these strokes — geometric auto-beautify must NOT
+      // mark them beautified first (it would starve the recognition queue).
+      queueHwRecognition();
+    } else {
+      if (autoBeautify && strokeTool === 'pen') scheduleAuto();
+      else if (!autoBeautify) setStatus('Stroke saved (Auto Beautify off).');
+      if (isHwStroke) queueHwRecognition(); // AI off: groups only, geometric fallback still applies
+    }
   };
 
   const onDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
