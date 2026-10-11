@@ -321,6 +321,15 @@ function CourseSubjectsContent({ slug }: { slug: string }) {
   const layout = course.contentLayout;
   const direct =
     isDirectContent(layout, course.name, course.slug);
+  // Flow-2 without any papers has no paper structure to show — open the
+  // chapters directly (flow-1 style) instead of a meaningless General bucket.
+  const hasAnyPapers = course.subjects.some((s) => s.papers.length > 0);
+  const paperlessFlow2 =
+    ((layout as string) === "flow-2" || (layout as string) === "paper") && !hasAnyPapers;
+
+  if (direct || paperlessFlow2) {
+    return <DirectContentView slug={slug} />;
+  }
   const useSubjectSelection =
     !direct &&
     ((layout as string) === "subject" ||
@@ -329,7 +338,7 @@ function CourseSubjectsContent({ slug }: { slug: string }) {
         course.category === "Medical Admission" &&
         course.subjects.length > 1));
 
-  if (direct) {
+  if (direct || paperlessFlow2) {
     return <DirectContentView slug={slug} />;
   }
 
