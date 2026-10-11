@@ -7,6 +7,8 @@ import { uid } from './types.ts';
 import { beautifyStroke, revertStroke, layoutCorrectGroup, deviationOf } from './beautify.ts';
 import { groupStrokes, pointInPolygon } from './grouping.ts';
 import { detectInkShape } from './inkShape.ts';
+import { groupIntoLines } from './lines.ts';
+import { expandCoalesced, shouldIgnorePointer } from './input.ts';
 import { loadBoards, saveBoards, loadProfile, saveProfile } from './storage.ts';
 import { DEFAULT_PROFILE, learnFromFeedback, deleteExample, clearMemory, countByScript, exportProfile, importProfile } from './memory.ts';
 
@@ -55,6 +57,7 @@ const ICONS: Record<string, string> = {
   ruler: 'M3 17L17 3l4 4L7 21l-4-4z M8.5 15.5l1.4 1.4 M11.5 12.5l1.4 1.4 M14.5 9.5l1.4 1.4',
   file: 'M6 2h8l4 4v16H6V2z M14 2v4h4 M9 13h6 M9 17h6',
   trash: 'M4 7h16 M9 7V4h6v3 M6 7l1 14h10l1-14 M10 11v6 M14 11v6',
+  hw: 'M4 20l1-4L16.5 4.5a2.1 2.1 0 013 3L8 19l-4 1z M14.5 6.5l3 3',
 };
 
 const TOOLS: Array<{ id: ToolKind; label: string; kbd: string }> = [
@@ -93,6 +96,8 @@ export default function Whiteboard() {
   const [rulerAngle, setRulerAngle] = useState(0);
   const [rulerOff, setRulerOff] = useState(-80);
   const [autoShape, setAutoShape] = useState(true);
+  const [hwMode, setHwMode] = useState(false);
+  const [palmReject, setPalmReject] = useState(true);
   const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky' }>(null);
   const [editText, setEditText] = useState('');
   const [boardNameDraft, setBoardNameDraft] = useState('');
@@ -116,6 +121,9 @@ export default function Whiteboard() {
   const moveRef = useRef<null | { sx: number; sy: number; orig: Map<string, Stroke>; moved: boolean }>(null);
   const selectedRef = useRef<Set<string>>(new Set());
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hwTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const processedHwRef = useRef<Set<string>>(new Set());
+  const penActiveRef = useRef(0);
   const profileRef = useRef(loadProfileSafe());
   const [memCount, setMemCount] = useState(0);
   const spaceDown = useRef(false);
@@ -470,6 +478,20 @@ export default function Whiteboard() {
     }, 0);
   }, [lang, strength, persist]);
 
+  /** Phase 1 stub: group handwritten strokes into lines/words after pause.
+   *  Phase 3 replaces the status-only tail with real recognition. */
+  const queueHwRecognition = useCallback(() => {
+    if (hwTimerRef.current) clearTimeout(hwTimerRef.current);
+    hwTimerRef.current = setTimeout(() => {
+      const pending = strokesRef.current.filter((s) => s.handwritten && s.tool === 'pen' && !s.beautified && !processedHwRef.current.has(s.id));
+      if (!pending.length) return;
+      const lines = groupIntoLines(pending, { pauseMs: 700 });
+      const words = lines.reduce((a, l) => a + l.words.length, 0);
+      for (const l of lines) for (const w of l.words) for (const id of w.strokeIds) processedHwRef.current.add(id);
+      setStatus(`Handwriting: ${lines.length} line(s), ${words} word(s) grouped — recognizer lands in Phase 3.`);
+    }, 700);
+  }, []);
+
   const scheduleAuto = useCallback(() => {
     if (!autoBeautify) return;
     if (timerRef.current) clearTimeout(timerRef.current);
@@ -677,6 +699,11 @@ export default function Whiteboard() {
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current!;
     canvas.setPointerCapture(e.pointerId);
+    if (e.pointerType === 'pen') penActiveRef.current++;
+    if (shouldIgnorePointer(e.pointerType, penActiveRef.current > 0, palmReject)) {
+      pointersRef.current.delete(e.pointerId);
+      return; // palm rejection: ignore touch while pen is down
+    }
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointersRef.current.size === 2) {
       // Second finger down -> pinch-zoom gesture (discard provisional stroke)
@@ -740,13 +767,20 @@ export default function Whiteboard() {
       setEditText('');
       return;
     }
-    const wpt = toWorld(e.clientX, e.clientY);
-    wpt.p = (e as unknown as { pressure?: number }).pressure ?? 0.5;
-    if ((tool === 'pen' || tool === 'highlighter') && rulerOn) {
-      const s = snapRuler(e.clientX, e.clientY);
-      if (s) { wpt.x = s.x; wpt.y = s.y; }
+    const samples = expandCoalesced(e.nativeEvent);
+    const startPts: InkPoint[] = [];
+    for (const s of samples) {
+      const wpt = toWorld(s.x, s.y);
+      wpt.p = s.p; wpt.pt = s.pt;
+      if ((tool === 'pen' || tool === 'highlighter') && rulerOn) {
+        const snapped = snapRuler(s.x, s.y);
+        if (snapped) { wpt.x = snapped.x; wpt.y = snapped.y; }
+      }
+      const last = startPts[startPts.length - 1];
+      if (!last || Math.hypot(last.x - wpt.x, last.y - wpt.y) > 0.5) startPts.push(wpt);
     }
-    drawingRef.current = { pts: [wpt], id: uid('s') };
+    if (!startPts.length) return;
+    drawingRef.current = { pts: startPts, id: uid('s') };
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -810,20 +844,26 @@ export default function Whiteboard() {
       }
       return;
     }
-    const wpt = toWorld(e.clientX, e.clientY);
-    wpt.p = (e as unknown as { pressure?: number }).pressure ?? 0.5;
-    if ((tool === 'pen' || tool === 'highlighter') && rulerOn) {
-      const s = snapRuler(e.clientX, e.clientY);
-      if (s) { wpt.x = s.x; wpt.y = s.y; }
-    }
+    const samples = expandCoalesced(e.nativeEvent);
     const pts = drawingRef.current.pts;
-    if (pts.length === 0 || Math.hypot(pts[pts.length - 1].x - wpt.x, pts[pts.length - 1].y - wpt.y) > 0.5) {
-      pts.push(wpt);
-      draw();
+    let drew = false;
+    for (const s of samples) {
+      const wpt = toWorld(s.x, s.y);
+      wpt.p = s.p; wpt.pt = s.pt;
+      if ((tool === 'pen' || tool === 'highlighter') && rulerOn) {
+        const snapped = snapRuler(s.x, s.y);
+        if (snapped) { wpt.x = snapped.x; wpt.y = snapped.y; }
+      }
+      if (pts.length === 0 || Math.hypot(pts[pts.length - 1].x - wpt.x, pts[pts.length - 1].y - wpt.y) > 0.5) {
+        pts.push(wpt);
+        drew = true;
+      }
     }
+    if (drew) draw();
   };
 
   const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (e.pointerType === 'pen') penActiveRef.current = Math.max(0, penActiveRef.current - 1);
     pointersRef.current.delete(e.pointerId);
     if (pinchRef.current) {
       if (pointersRef.current.size < 2) {
@@ -908,12 +948,14 @@ export default function Whiteboard() {
     strokesRef.current = [...strokesRef.current, {
       id: d.id, points: pts, color, width, tool: strokeTool,
       ...(shapeParams ? { shape: shapeParams.shape, ax: shapeParams.ax, ay: shapeParams.ay, bx: shapeParams.bx, by: shapeParams.by } : {}),
+      handwritten: hwMode && !isShapeTool && tool === 'pen',
       createdAt: Date.now(),
     }];
     persist(strokesRef.current, camRef.current);
     rerender();
     if (autoBeautify && strokeTool === 'pen') scheduleAuto();
     else if (!autoBeautify) setStatus('Stroke saved (Auto Beautify off).');
+    if (hwMode && strokeTool === 'pen' && !isShapeTool) queueHwRecognition();
   };
 
   const onWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
@@ -1287,6 +1329,18 @@ export default function Whiteboard() {
           </button>
         ))}
         <div className="my-1 h-px w-8 bg-white/10" />
+        <button
+          onClick={() => {
+            setHwMode((v) => {
+              setStatus(v ? 'Handwriting mode off — normal drawing.' : 'Handwriting mode on — pen strokes will be recognized as text.');
+              return !v;
+            });
+          }}
+          title="Handwriting mode: strokes become text candidates"
+          className={`rounded-xl p-2.5 transition active:scale-90 ${hwMode ? 'bg-sky-400 text-neutral-950 shadow-lg shadow-sky-400/30' : 'text-neutral-300 hover:bg-white/10'}`}>
+          <Icon d={ICONS.hw} />
+        </button>
+        <div className="my-1 h-px w-8 bg-white/10" />
         <button onClick={undo} title="Undo (Ctrl+Z)" className={railBtn}><Icon d={ICONS.undo} /></button>
         <button onClick={redo} title="Redo (Ctrl+Y)" className={railBtn}><Icon d={ICONS.redo} /></button>
       </div>
@@ -1458,6 +1512,7 @@ export default function Whiteboard() {
 
           <DockSection title="Canvas & Export" icon={ICONS.fit}>
             <Toggle label="Auto-convert shapes" hint="Rough circles/rects/lines become perfect" checked={autoShape} onChange={setAutoShape} />
+            <Toggle label="Palm rejection" hint="Ignore touch while pen is down" checked={palmReject} onChange={setPalmReject} />
             <div className="mt-2 grid grid-cols-2 gap-1.5">
               <button onClick={fitToContent} className={miniBtn}>Fit (F)</button>
               <button onClick={resetView} className={miniBtn}>Reset (0)</button>

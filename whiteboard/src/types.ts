@@ -13,6 +13,8 @@ export interface InkPoint {
   t: number;
   /** pressure 0..1 when available */
   p?: number;
+  /** pointerType at capture: 'pen' | 'touch' | 'mouse' */
+  pt?: string;
 }
 
 export interface Stroke {
@@ -23,6 +25,8 @@ export interface Stroke {
   color: string;
   width: number;
   tool: 'pen' | 'highlighter' | 'line' | 'arrow' | 'rect' | 'ellipse';
+  /** true when drawn in Handwriting mode (recognition candidate) */
+  handwritten?: boolean;
   /** Parametric shape geometry (new shapes). Legacy strokes use points only. */
   shape?: 'line' | 'arrow' | 'rect' | 'ellipse';
   ax?: number; ay?: number; bx?: number; by?: number;
