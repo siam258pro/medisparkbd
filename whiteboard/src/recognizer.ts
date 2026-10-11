@@ -71,6 +71,9 @@ export function splitMixedLine(text: string): ScriptRun[] {
   return runs.filter((r) => r.text.length > 0);
 }
 
+/** Below this confidence the app never auto-replaces (chips instead). */
+export const LOW_CONFIDENCE = 0.6;
+
 /** Deterministic hash of stroke geometry for caching (cyrb53). */
 export function hashStrokes(strokes: Stroke[]): string {
   let h1 = 0xdeadbeef, h2 = 0x41c6ce57;

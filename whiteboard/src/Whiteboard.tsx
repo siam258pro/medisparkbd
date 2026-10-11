@@ -11,7 +11,7 @@ import { groupStrokes, pointInPolygon } from './grouping.ts';
 import { detectInkShape } from './inkShape.ts';
 import { groupIntoLines } from './lines.ts';
 import { expandCoalesced, shouldIgnorePointer } from './input.ts';
-import { VisionLlmRecognizer, type RecResult, verifyLang, normalizeBanglaNFC, type RecLang } from './recognizer.ts';
+import { VisionLlmRecognizer, type RecResult, verifyLang, normalizeBanglaNFC, type RecLang, LOW_CONFIDENCE } from './recognizer.ts';
 import type { TextLine } from './lines.ts';
 import { pickFont, ensureFonts, fitFontSize, measureCanvas } from './handText.ts';
 import { loadBoards, saveBoards, loadProfile, saveProfile } from './storage.ts';
@@ -109,7 +109,7 @@ export default function Whiteboard() {
   const [aiNotice, setAiNotice] = useState(false);
   const [chips, setChips] = useState<Array<{ key: string; ids: string[]; text: string; alternatives: string[]; lang: RecLang; sx: number; sy: number }>>([]);
   const [recMode, setRecMode] = useState<'clean' | 'convert'>('clean');
-  const LOW_CONF = 0.6;
+  const LOW_CONF = LOW_CONFIDENCE;
   const [editing, setEditing] = useState<null | { wx: number; wy: number; sx: number; sy: number; kind: 'text' | 'sticky'; editId?: string }>(null);
   const [editText, setEditText] = useState('');
   const [boardNameDraft, setBoardNameDraft] = useState('');

@@ -78,8 +78,39 @@ npx tsc --noEmit   # typecheck
 5. Shortcuts: `P`en `H`ighlighter `E`raser `V`select `T`ext, `Space`-drag pan,
    wheel zoom, `F` fit, `0` reset, `Ctrl+Z/Y` undo/redo, `Del` delete selection.
 
-Language selector (`Auto/বাংলা/English/Mixed`) tunes grouping tolerance
-(Bangla allows wider vertical spread so vowel signs stay grouped).
+## Handwriting recognition (backend required for AI features)
+
+Geometric beautification works fully offline. AI transcription needs the
+bundled backend (API key stays server-side, never in the browser bundle):
+
+```bash
+cp .env.example .env     # then set LLM_API_KEY inside
+npm run server           # :3001  (health: GET /api/health)
+npm run dev              # :5173, proxies /api -> :3001
+```
+
+Flow: Handwriting-mode pen strokes → 700ms debounce → `groupIntoLines` →
+PNG rasterize → `POST /api/recognize` (sha256 cache, 20 req/min/IP, 25s
+upstream timeout, strict no-correction prompt) → NFC + Unicode-range verify →
+clean-strokes or convert-to-text (Atma/Caveat, double-click to edit).
+Low confidence (<0.6) never auto-replaces — chips offer alternatives.
+Enable "Use AI" in the dock (privacy notice on first enable).
+
+Accuracy report (mocked backend, `tests/pipeline.test.ts` + `tests/fixtures.ts`):
+| Fixture | Grouping | Lang/font decision | Auto-replace |
+|---|---|---|---|
+| "hello" (5 strokes) | 1 line / 1 word ✓ | en → Caveat ✓ | allowed at 0.95 ✓ |
+| "বিজ্ঞান"-shaped (5 strokes, dot kept) | 1 line / 1 word ✓ | bn → Atma, NFC intact ✓ | allowed at 0.92 ✓ |
+| mixed EN+BN line | 1 line / 2 words ✓ | mixed, script runs en/bn ✓ | allowed at 0.88 ✓ |
+| low-conf 0.3 + alternatives | — | — | blocked, chips shown ✓ |
+| local budget (group+clean, mixed line) | <10ms measured | budget 300ms ✓ | — |
+
+Live-LLM transcription accuracy is not asserted here (needs your key +
+real handwriting) — run the acceptance lines ("hello", "বাংলা") manually
+with `LLM_API_KEY` set and confirm both modes before classroom use.
+
+Language selector (`Auto/বাংলা/English/Mixed`) tunes geometric grouping
+tolerance (Bangla allows wider vertical spread so vowel signs stay grouped).
 
 ## Templates: PDF slides, PPTX, images, patterns
 
