@@ -25,6 +25,8 @@ export interface Stroke {
   color: string;
   width: number;
   tool: 'pen' | 'highlighter' | 'line' | 'arrow' | 'rect' | 'ellipse';
+  /** render with variable-width (perfect-freehand) outline */
+  variableWidth?: boolean;
   /** true when drawn in Handwriting mode (recognition candidate) */
   handwritten?: boolean;
   /** Parametric shape geometry (new shapes). Legacy strokes use points only. */

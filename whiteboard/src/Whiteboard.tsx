@@ -5,6 +5,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { BeautifyStrength, Board, BoardBackground, BoardTheme, Camera, InkPoint, ScriptPref, Stroke, ToolKind } from './types.ts';
 import { uid } from './types.ts';
 import { beautifyStroke, revertStroke, layoutCorrectGroup, deviationOf } from './beautify.ts';
+import { cleanStroke, normalizeGroupHeight } from './cleanStrokes.ts';
+import { getStroke } from 'perfect-freehand';
 import { groupStrokes, pointInPolygon } from './grouping.ts';
 import { detectInkShape } from './inkShape.ts';
 import { groupIntoLines } from './lines.ts';
@@ -83,6 +85,7 @@ export default function Whiteboard() {
   const [width, setWidth] = useState(3.5);
   const [autoBeautify, setAutoBeautify] = useState(true);
   const [strength, setStrength] = useState<BeautifyStrength>('balanced');
+  const [inkStyle, setInkStyle] = useState<'geometric' | 'clean'>('geometric');
   const [delayMs, setDelayMs] = useState(700);
   const [lang, setLang] = useState<ScriptPref>('auto');
   const [showOriginal, setShowOriginal] = useState(false);
@@ -266,6 +269,27 @@ export default function Whiteboard() {
         return;
       }
       if (pts.length === 0) return;
+      // Variable-width clean-strokes rendering (perfect-freehand outline).
+      if (s.variableWidth && pts.length > 1 && !ghost) {
+        const outline = getStroke(pts.map((p) => [p.x, p.y, p.p ?? 0.5]), {
+          size: Math.max(2, s.width * 2.2), thinning: 0.65, smoothing: 0.6, streamline: 0.5, simulatePressure: false,
+        });
+        if (outline.length > 2) {
+          ctx.fillStyle = s.color;
+          ctx.beginPath();
+          outline.forEach((o, i) => i ? ctx.lineTo(X(o[0]), Y(o[1])) : ctx.moveTo(X(o[0]), Y(o[1])));
+          ctx.closePath();
+          ctx.fill();
+          if (selectedRef.current.has(s.id)) {
+            ctx.strokeStyle = '#38bdf8'; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+            let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+            for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+            ctx.strokeRect(X(x0) - 6, Y(y0) - 6, (x1 - x0) * cam.zoom + 12, (y1 - y0) * cam.zoom + 12);
+            ctx.setLineDash([]);
+          }
+          return;
+        }
+      }
       // Parametric shapes render crisp (not from point clouds).
       if (s.shape && s.ax !== undefined && s.ay !== undefined && s.bx !== undefined && s.by !== undefined) {
         const { shape, ax, ay, bx, by } = s;
@@ -436,6 +460,21 @@ export default function Whiteboard() {
       for (const g of groups) {
         if (g.kind === 'shape' || g.kind === 'diagram' || g.kind === 'math') continue;
         const gs = g.strokeIds.map((id) => byId.get(id)).filter(Boolean) as Stroke[];
+        if (inkStyle === 'clean') {
+          // Clean-strokes mode: capped height normalization + One-Euro/RDP/straighten.
+          const raws = gs.map((s) => (s.originalPoints ?? s.points).map((p) => ({ ...p })));
+          const leveled = normalizeGroupHeight(raws);
+          gs.forEach((s, i) => {
+            if (s.beautified && s.originalPoints) return;
+            const idx = all.findIndex((x) => x.id === s.id);
+            if (idx < 0) return;
+            const trueRaw = s.points.slice();
+            const nb = cleanStroke({ ...s, points: leveled[i] ?? s.points });
+            all[idx] = { ...nb, originalPoints: trueRaw };
+            changed++;
+          });
+          continue;
+        }
         const corrected = layoutCorrectGroup(gs.map((s) => (s.originalPoints ?? s.points).map((p) => ({ ...p }))), strength, params);
         gs.forEach((s, i) => {
           if (s.beautified && s.originalPoints) return;
@@ -476,7 +515,7 @@ export default function Whiteboard() {
       setBusy(false);
       rerender();
     }, 0);
-  }, [lang, strength, persist]);
+  }, [lang, strength, inkStyle, persist]);
 
   /** Phase 1 stub: group handwritten strokes into lines/words after pause.
    *  Phase 3 replaces the status-only tail with real recognition. */
@@ -1408,6 +1447,15 @@ export default function Whiteboard() {
 
           <DockSection title="Beautify" icon={ICONS.spark} defaultOpen>
             <Toggle label="Auto Beautify" hint="Process after pause" checked={autoBeautify} onChange={setAutoBeautify} />
+            <label className="mt-2 block text-xs text-neutral-400">Ink style</label>
+            <div className="mt-1 grid grid-cols-2 gap-1.5">
+              {(['geometric', 'clean'] as const).map((m) => (
+                <button key={m} onClick={() => setInkStyle(m)}
+                  className={`rounded-lg border py-1.5 text-xs capitalize transition active:scale-95 ${inkStyle === m ? 'border-amber-400 bg-amber-400/15 text-amber-200' : 'border-white/10 text-neutral-400 hover:bg-white/5'}`}>
+                  {m === 'clean' ? 'Clean strokes' : 'Geometric'}
+                </button>
+              ))}
+            </div>
             <label className="mt-2 block text-xs text-neutral-400">Strength</label>
             <div className="mt-1 grid grid-cols-3 gap-1.5">
               {(['subtle', 'balanced', 'strong'] as BeautifyStrength[]).map((s) => (
