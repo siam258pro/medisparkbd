@@ -2,6 +2,8 @@
 
 # dependencies
 /node_modules
+/whiteboard/node_modules/
+/whiteboard/dist/
 /.pnp
 .pnp.*
 .yarn/*
