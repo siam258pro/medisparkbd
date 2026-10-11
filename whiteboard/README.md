@@ -89,6 +89,16 @@ npm run server           # :3001  (health: GET /api/health)
 npm run dev              # :5173, proxies /api -> :3001
 ```
 
+Groq (OpenAI-compatible) example for `.env`:
+```bash
+LLM_API_URL=https://api.groq.com/openai/v1/chat/completions
+LLM_API_KEY=gsk_your_key_here
+LLM_MODEL=meta-llama/llama-4-maverick-17b-128e-instruct
+```
+Restart `npm run server` after editing `.env` — the log must say `key=set`.
+The app's AI toggle also checks `/api/health` and reports `configured:false`
+if the key is missing.
+
 Flow: Handwriting-mode pen strokes → 700ms debounce → `groupIntoLines` →
 PNG rasterize → `POST /api/recognize` (sha256 cache, 20 req/min/IP, 25s
 upstream timeout, strict no-correction prompt) → NFC + Unicode-range verify →
