@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import {
   fetchFreshPublicExams,
-  isEmptiedFreeExamCategory,
   resolveExamCategoryRow,
 } from "@/lib/public-exams-server";
 import { withCache } from "@/lib/api-cache";
@@ -22,11 +21,6 @@ export async function GET(request: Request) {
     const row = await resolveExamCategoryRow(key);
     if (!row) {
       return NextResponse.json({ error: "Category not found." }, { status: 404 });
-    }
-    // Same Free Exams display-only gate as the category page: an emptied
-    // category's client-side refresh must also resolve to an empty listing.
-    if (isEmptiedFreeExamCategory(row)) {
-      return withCache(NextResponse.json({ exams: [] }), "NO_CACHE");
     }
     const exams = await fetchFreshPublicExams({ categoryId: row.id });
     return withCache(NextResponse.json({ exams }), "NO_CACHE");

@@ -273,25 +273,17 @@ export type PublicExamCategoryCard = {
 };
 
 /**
- * Temporary display-only gate for the main website Free Exams section.
- * The Medical Admission and HSC Academic category cards stay visible, but
- * their exam listings render empty until the section is configured.
- * No database records are affected — callers simply serve [] instead of
- * the fetched rows. Public Exam Control and all other categories are
- * untouched.
+ * Free Exam Control is directly connected to the main website Free Exams
+ * section: every category managed through Free Exam Control (including
+ * Medical Admission and HSC Academic) serves its real exam records.
+ * This helper is kept for backwards compatibility and always returns
+ * false — no category is ever emptied. No database records are affected.
  */
-export function isEmptiedFreeExamCategory(row: {
+export function isEmptiedFreeExamCategory(_row: {
   id: string;
   slug: string;
 }): boolean {
-  if (row.id === "category-medical" || row.id === "category-hsc") return true;
-  const slug = row.slug.trim().toLowerCase();
-  return (
-    slug === "medical" ||
-    slug === "hsc" ||
-    slug.startsWith("medical") ||
-    slug.startsWith("hsc")
-  );
+  return false;
 }
 
 /**

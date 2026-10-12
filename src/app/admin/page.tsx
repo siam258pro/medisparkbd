@@ -22,7 +22,7 @@ const CARDS: Array<{ href: string; icon: string; title: string }> = [
   { href: "/admin/course-control", icon: "📚", title: "Course Control" },
   { href: "/admin/course-content-control", icon: "📖", title: "Course Content Control" },
   { href: "/admin/material-pdf", icon: "📄", title: "Material PDF Generator" },
-  { href: "/admin/public-exam-control", icon: "📝", title: "Public Exam Control" },
+  { href: "/admin/public-exam-control", icon: "📝", title: "Free Exam Control" },
   { href: "/admin/qa-control", icon: "❓", title: "Q&A Control" },
   { href: "/admin/dashboard-control", icon: "📊", title: "Dashboard Control" },
   { href: "/admin/student-control", icon: "👨‍🎓", title: "Student Control" },

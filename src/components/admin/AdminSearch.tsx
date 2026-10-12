@@ -21,7 +21,7 @@ const SEARCH_INDEX: SearchEntry[] = [
   { label: "Course Control", href: "/admin/course-control", section: "Courses" },
   { label: "Course Content Control", href: "/admin/course-content-control", section: "Courses" },
   { label: "Material PDF Generator", href: "/admin/material-pdf", section: "Courses" },
-  { label: "Public Exam Control", href: "/admin/public-exam-control", section: "Exams" },
+  { label: "Free Exam Control", href: "/admin/public-exam-control", section: "Exams" },
   { label: "Exam Rules", href: "/admin/exam-rules", section: "Exams" },
   { label: "Paste Format", href: "/admin/exam-paste-format", section: "Exams" },
   { label: "Question Bank", href: "/admin/exams/question-bank", section: "Exams" },

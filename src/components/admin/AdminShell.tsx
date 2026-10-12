@@ -91,7 +91,7 @@ const ADMIN_NAV = [
   { label: "Course Control", href: "/admin/course-control", icon: CoursesIcon },
   { label: "Course Content Control", href: "/admin/course-content-control", icon: BookOpenIcon },
   { label: "Material PDF Generator", href: "/admin/material-pdf", icon: ExamsIcon },
-  { label: "Public Exam Control", href: "/admin/public-exam-control", icon: ExamsIcon },
+  { label: "Free Exam Control", href: "/admin/public-exam-control", icon: ExamsIcon },
   { label: "Exam Rules", href: "/admin/exam-rules", icon: ExamsIcon },
   { label: "Paste Format", href: "/admin/exam-paste-format", icon: ExamsIcon },
   { label: "Q&A Control", href: "/admin/qa-control", icon: FaqIcon },

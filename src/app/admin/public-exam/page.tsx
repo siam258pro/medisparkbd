@@ -47,8 +47,8 @@ export default async function AdminPublicExamHub() {
   return (
     <section className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
       <HubHeader
-        eyebrow="Admin · Public Exam"
-        title="Public Exam Control"
+        eyebrow="Admin · Free Exam"
+        title="Free Exam Control"
         description="Select a category to view and manage its public exams. New exams created inside a category automatically belong to that category."
       />
 

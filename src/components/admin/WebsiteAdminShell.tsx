@@ -23,7 +23,7 @@ const ADMIN_NAV = [
   { label: "Home Page Control", href: "/admin/home-control" },
   { label: "Course Control", href: "/admin/course-control" },
   { label: "Course Content Control", href: "/admin/course-content-control" },
-  { label: "Public Exam Control", href: "/admin/public-exam-control" },
+  { label: "Free Exam Control", href: "/admin/public-exam-control" },
   { label: "Q&A Control", href: "/admin/qa-control" },
   { label: "Dashboard Control", href: "/admin/dashboard-control" },
   { label: "Student Control", href: "/admin/student-control" },
