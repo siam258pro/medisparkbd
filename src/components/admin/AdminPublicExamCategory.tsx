@@ -11,7 +11,6 @@ import {
 import { examToPublic } from "@/lib/public-exam-view";
 import type { Exam } from "@/lib/exams-admin";
 import {
-  categorizeExam,
   categoryLabels,
   type ExamCategory,
   type PublicExam,
@@ -35,7 +34,9 @@ export default function AdminPublicExamCategory({
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch("/api/admin/exams?kind=public,practice", {
+      // PUBLIC scope at the API level: course-linked (enrolled) exams can
+      // never arrive here, regardless of later client-side grouping.
+      const response = await fetch("/api/admin/exams?kind=public,practice&scope=PUBLIC", {
         cache: "no-store",
         headers: gate.headers,
       });
@@ -157,10 +158,9 @@ export default function AdminPublicExamCategory({
         )}
       />
 
-      {exams !== null &&
-        exams.every((exam) => categorizeExam(exam) !== category) && (
-          <p className="sr-only">No exams in this category yet.</p>
-        )}
+      {exams !== null && exams.length === 0 && (
+        <p className="sr-only">No exams in this category yet.</p>
+      )}
 
       {notice && (
         <p

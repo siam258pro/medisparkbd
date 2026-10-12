@@ -105,7 +105,12 @@ export default function PublicExamList({
     (exam) =>
       (showDrafts || exam.published) &&
       (batch === "All Batches" || exam.batch === batch) &&
-      (mode === "all" || (exam.examMode ?? "live") === mode),
+      (mode === "all" || (exam.examMode ?? "live") === mode) &&
+      // Strict separation: this is a public/free-exam list component — a
+      // course (enrolled) exam must never render here even if a caller passes
+      // unfiltered rows. Ownership is the module relationship (kind/scope),
+      // never the title or display grouping below.
+      (exam as unknown as { kind?: string }).kind !== "enrolled",
   );
 
   const grouped = useMemo(() => {

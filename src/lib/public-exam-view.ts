@@ -25,6 +25,7 @@ export function examToPublic(exam: Exam): PublicExam {
       : null;
   return {
     id: exam.id,
+    categoryId: exam.categoryId ?? null,
     name: exam.title,
     description: exam.description ?? null,
     bannerUrl: exam.bannerUrl ?? null,

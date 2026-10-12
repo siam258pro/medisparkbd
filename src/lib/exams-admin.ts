@@ -839,8 +839,13 @@ export async function fetchExams(
       params.push(filters.chapterId);
     }
     // Flow 4 course filter — join exam_courses (public flow untouched).
+    // A course filter always means COURSE scope: public/free exams never
+    // carry a course assignment (saveExam clears cross-scope linkage), and
+    // this guard keeps it true at read time even for stale rows — a course
+    // filter shows exclusively that course's exams, never PUBLIC exams.
     const needsCourseJoin = Boolean(filters.courseId);
     if (filters.courseId) {
+      where.push(`kind = 'enrolled'`);
       where.push(
         `id IN (SELECT exam_id FROM exam_courses WHERE course_id = ?)`,
       );
@@ -2095,6 +2100,10 @@ export async function fetchPublishedCourseExams(
   if (!course) return [];
   try {
     await ensureTables();
+    // Strict per-course isolation: the chapter → subject → course branch must
+    // also constrain the chapter to THIS course (a shared subject assigned to
+    // several courses must never leak another course's chapter exams here).
+    // Same guard as fetchFreshCourseExamShortcuts / Flow-5 selectors.
     const rows = await query<ExamRow[]>(
       `SELECT ${EXAM_COLUMNS} FROM exams ex
         WHERE ex.kind = 'enrolled' AND ex.status = 'published'
@@ -2104,10 +2113,12 @@ export async function fetchPublishedCourseExams(
               SELECT 1 FROM course_chapters ch
                 JOIN course_subject_assignments a ON a.subject_id = ch.subject_id
                WHERE ch.id = ex.chapter_id AND a.course_slug = ?
+                 AND ch.is_active = 1
+                 AND (COALESCE(ch.course_slug, '') = '' OR ch.course_slug = a.course_slug)
             )
             OR EXISTS (
               SELECT 1 FROM course_chapters ch2
-               WHERE ch2.id = ex.chapter_id AND ch2.course_slug = ?
+               WHERE ch2.id = ex.chapter_id AND ch2.course_slug = ? AND ch2.is_active = 1
             )
           )
         ORDER BY ex.sort_order ASC, ex.created_at DESC`,
