@@ -84,19 +84,24 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
     }
   }
 
-  if (authLoading) return <AccessLoading label="Loading enrolled courses…" />;
-  if (!user) return <AccessMessage title="Login Required" message="Sign in to access exams in your enrolled courses." actionLabel="Login" actionHref="/login?next=%2Fexam%2Fenrolled" />;
-  const items = courses?.uid === user.uid ? courses.items : null;
-  if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
-
   // Courses Exams tab: no course filter pills — directly shows all currently
-  // live course exams. Standalone /exam/enrolled keeps the original
-  // navigate-to-course flow unchanged.
+  // live course exams. This branch must run BEFORE the auth/enrollment gates
+  // below: the embedded listing is intentionally public (its featured API is
+  // unauthenticated; enrollment is still enforced at exam-start time), and the
+  // standalone `load()` is a no-op when embedded, so `courses` would stay null
+  // forever and the `!items` spinner below would park at 90% indefinitely.
+  // Standalone /exam/enrolled keeps the original navigate-to-course flow
+  // unchanged.
   if (embedded) {
     return (
       <EmbeddedCourseExams />
     );
   }
+
+  if (authLoading) return <AccessLoading label="Loading enrolled courses…" />;
+  if (!user) return <AccessMessage title="Login Required" message="Sign in to access exams in your enrolled courses." actionLabel="Login" actionHref="/login?next=%2Fexam%2Fenrolled" />;
+  const items = courses?.uid === user.uid ? courses.items : null;
+  if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-12">
@@ -153,9 +158,14 @@ function EmbeddedCourseExams() {
   const [now, setNow] = useState(() => Date.now());
 
   const loadLive = useCallback(async () => {
+    // Bound the request so a hung connection surfaces the error + retry UI
+    // instead of spinning forever.
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
     try {
       const response = await fetch(`/api/courses-exams/featured`, {
         cache: "no-store",
+        signal: controller.signal,
       });
       const data = (await response.json()) as { exams?: CourseExamShortcut[]; error?: string };
       if (!response.ok || !Array.isArray(data.exams)) {
@@ -164,7 +174,13 @@ function EmbeddedCourseExams() {
       setExams(data.exams);
       setExamsError(null);
     } catch (cause) {
-      setExamsError(cause instanceof Error ? cause.message : "Could not load course exams.");
+      if (controller.signal.aborted) {
+        setExamsError("Could not load course exams.");
+      } else {
+        setExamsError(cause instanceof Error ? cause.message : "Could not load course exams.");
+      }
+    } finally {
+      window.clearTimeout(timeout);
     }
   }, []);
 
