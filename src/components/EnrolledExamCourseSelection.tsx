@@ -89,8 +89,8 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
   const items = courses?.uid === user.uid ? courses.items : null;
   if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
-  // Courses Exams tab: no course filter pills — directly shows the currently
-  // live featured course exam. Standalone /exam/enrolled keeps the original
+  // Courses Exams tab: no course filter pills — directly shows all currently
+  // live course exams. Standalone /exam/enrolled keeps the original
   // navigate-to-course flow unchanged.
   if (embedded) {
     return (
@@ -137,9 +137,8 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
 }
 
 /**
- * Embedded Courses Exams: no course filter pills — directly shows the
- * currently Live featured course exam (the existing "Physics 2nd Paper
- * Exam 1" record from Special Medical Exam Batch) via the featured
+ * Embedded Courses Exams: no course filter pills — directly shows every
+ * currently Live Course Content exam across all courses via the featured
  * endpoint, with no course selection step. Start Exam reuses the shared
  * ExamCard, so it opens the original exam through the unchanged exam-start
  * flow (rules page → attempt APIs), preserving enrollment requirements,
@@ -149,6 +148,9 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
 function EmbeddedCourseExams() {
   const [exams, setExams] = useState<CourseExamShortcut[] | null>(null);
   const [examsError, setExamsError] = useState<string | null>(null);
+  // Client clock so an exam whose end time passes while the page is open is
+  // concealed immediately, even before the next server refetch lands.
+  const [now, setNow] = useState(() => Date.now());
 
   const loadLive = useCallback(async () => {
     try {
@@ -169,22 +171,34 @@ function EmbeddedCourseExams() {
   useEffect(() => {
     setExams(null);
     setExamsError(null);
+    setNow(Date.now());
     const initialLoad = window.setTimeout(() => void loadLive(), 0);
-    const onVisible = () => { if (document.visibilityState === "visible") void loadLive(); };
+    const onVisible = () => { if (document.visibilityState === "visible") { setNow(Date.now()); void loadLive(); } };
     window.addEventListener("focus", onVisible);
     document.addEventListener("visibilitychange", onVisible);
+    // Tick the client clock so locally-expired exams are concealed even if
+    // a refetch is delayed; the visible-interval refetch below still pulls
+    // fresh server-computed Live state at the same cadence.
+    const clock = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => {
       window.clearTimeout(initialLoad);
+      window.clearInterval(clock);
       window.removeEventListener("focus", onVisible);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [loadLive]);
   useVisibleInterval(loadLive, 60_000);
 
-  // The fetch above already returns only the currently Live featured exam;
-  // filter again client-side so Upcoming / Practice / ended rows can never
-  // render here even if an older cached payload arrives.
-  const liveExams = (exams ?? []).filter((exam) => exam.status === "Live" && exam.examMode !== "practice");
+  // The fetch above already returns only currently Live exams; filter again
+  // client-side so Upcoming / Practice / ended rows can never render here
+  // even if an older cached payload arrives, and conceal any exam whose end
+  // time has passed since the payload was computed (stale-data guard).
+  const liveExams = (exams ?? []).filter((exam) => {
+    if (exam.status !== "Live" || exam.examMode === "practice") return false;
+    if (exam.endsAt && Number.isFinite(new Date(exam.endsAt).getTime()) && new Date(exam.endsAt).getTime() < now) return false;
+    if (exam.scheduledAt && Number.isFinite(new Date(exam.scheduledAt).getTime()) && new Date(exam.scheduledAt).getTime() > now) return false;
+    return true;
+  });
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6" aria-label="Courses Exams">
