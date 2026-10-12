@@ -71,11 +71,13 @@ export default function PublicExamCategoryView({
   exams,
   batches,
   categoryKey,
+  categorySlug,
   serverNowMs = Date.now(),
 }: {
   exams: PublicExam[];
   batches: string[];
-  categoryKey: ExamCategory;
+  categoryKey: string;
+  categorySlug?: string;
   serverNowMs?: number;
 }) {
   const [tab, setTab] = useState<ModeTab>("live");
@@ -207,12 +209,13 @@ export default function PublicExamCategoryView({
     [batchFiltered, nowMs],
   );
 
-  const useSubjectCards = practiceUsesSubjectCards(categoryKey, practiceExams);
-  const isMedical = categoryKey === "medical-admission";
+  const useSubjectCards = practiceUsesSubjectCards(categoryKey as ExamCategory, practiceExams);
+  const slugToken = `${categorySlug ?? ""} ${categoryKey}`.toLowerCase();
+  const isMedical = categoryKey === "medical-admission" || /medical/.test(slugToken);
 
   const practiceSubjects = useMemo(() => {
     if (!useSubjectCards) return [];
-    if (categoryKey === "medical-admission") {
+    if (isMedical) {
       const counts = new Map<string, number>();
       let other = 0;
       for (const exam of practiceExams) {
@@ -240,11 +243,11 @@ export default function PublicExamCategoryView({
       title,
       count: practiceExams.filter((exam) => exam.subject === title).length,
     }));
-  }, [useSubjectCards, categoryKey, practiceExams]);
+  }, [useSubjectCards, isMedical, practiceExams]);
 
   const visiblePractice = useMemo(() => {
     if (!useSubjectCards || !subject) return practiceExams;
-    if (categoryKey === "medical-admission") {
+    if (isMedical) {
       if (subject === OTHER_PRACTICE_SUBJECT_KEY) {
         return practiceExams.filter(
           (exam) => !matchMedicalPracticeSubject(exam.subject),
@@ -255,7 +258,7 @@ export default function PublicExamCategoryView({
       );
     }
     return practiceExams.filter((exam) => exam.subject === subject);
-  }, [useSubjectCards, subject, categoryKey, practiceExams]);
+  }, [useSubjectCards, subject, isMedical, practiceExams]);
 
   function selectTab(next: ModeTab) {
     setTab(next);

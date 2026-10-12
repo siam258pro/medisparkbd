@@ -257,3 +257,89 @@ export async function fetchPracticeExamCounts(): Promise<ExamCounts> {
 export async function fetchLiveExamCounts(): Promise<ExamCounts> {
   return (await fetchRequestExamCounts()).counts;
 }
+
+export type PublicExamCategoryCard = {
+  id: string;
+  slug: string;
+  name: string;
+  label: string;
+  liveCount: number;
+  practiceCount: number;
+};
+
+/**
+ * Dynamic Free Exams inventory — one entry per ACTIVE Course Category.
+ * Same published PUBLIC scope as fetchPublicExamCounts. No hardcoded list:
+ * disabling a category hides it, re-enabling shows it again.
+ */
+export async function fetchPublicExamCategoryCards(): Promise<PublicExamCategoryCard[]> {
+  const { examCategoryLabel } = await import("@/lib/public-exams");
+  const now = new Date().toISOString().slice(0, 23).replace("T", " ");
+  const [categoryRows, rows] = await Promise.all([
+    query<{ id: string; slug: string; name: string; sort_order: number }[]>(
+      `SELECT id, slug, name, sort_order FROM course_categories
+       WHERE is_active = 1
+       ORDER BY sort_order ASC, created_at ASC`,
+      [],
+      { cache: false },
+    ),
+    query<ExamCountRow[]>(
+      `SELECT category_id,
+          SUM(CASE WHEN kind = 'public' AND COALESCE(exam_mode, 'live') <> 'practice'
+            AND (scheduled_at IS NULL OR scheduled_at <= ?)
+            AND (ends_at IS NULL OR ends_at > ?)
+            THEN 1 ELSE 0 END) AS live_count,
+          SUM(CASE WHEN exam_mode = 'practice' OR kind = 'practice'
+            OR (kind = 'public' AND COALESCE(exam_mode, 'live') <> 'practice'
+              AND (scheduled_at IS NULL OR scheduled_at <= ?)
+              AND ends_at IS NOT NULL AND ends_at <= ?)
+            THEN 1 ELSE 0 END) AS practice_count
+        FROM exams
+        WHERE kind IN ('public', 'practice') AND status = 'published'
+          AND COALESCE(archived, 0) = 0
+        GROUP BY category_id`,
+      [now, now, now, now],
+      { cache: false },
+    ),
+  ]);
+  const byId = new Map(rows.map((row) => [row.category_id, row]));
+  return categoryRows.map((category) => {
+    const row = byId.get(category.id);
+    return {
+      id: category.id,
+      slug: category.slug,
+      name: category.name,
+      label: examCategoryLabel({ name: category.name, slug: category.slug }),
+      liveCount: Number(row?.live_count ?? 0),
+      practiceCount: Number(row?.practice_count ?? 0),
+    };
+  });
+}
+
+/**
+ * Resolve any exam-category URL segment — legacy keys (ssc-academic, …)
+ * plus raw active-category slugs (including custom categories) — to its
+ * real Course Control category row. Returns null when there is no match.
+ */
+export async function resolveExamCategoryRow(
+  segment: string,
+): Promise<{ id: string; slug: string; name: string; label: string } | null> {
+  const { examCategoryLabel } = await import("@/lib/public-exams");
+  const key = segment.trim().toLowerCase();
+  const legacy = (examCategorySlugs as Record<string, string>)[key];
+  const categories = await fetchActiveCourseCategories();
+  const match = legacy
+    ? (categories.find(
+        (category) =>
+          category.slug.toLowerCase() === legacy ||
+          category.slug.toLowerCase().startsWith(legacy),
+      ) ?? null)
+    : (categories.find((category) => category.slug.toLowerCase() === key) ?? null);
+  if (!match) return null;
+  return {
+    id: match.id,
+    slug: match.slug,
+    name: match.name,
+    label: examCategoryLabel({ name: match.name, slug: match.slug }),
+  };
+}

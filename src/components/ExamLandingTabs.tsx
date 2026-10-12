@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import ExamCategoryCards from "@/components/ExamCategoryCards";
+import ExamCategoryCards, { type CategoryCardItem } from "@/components/ExamCategoryCards";
 import EnrolledExamCourseSelection from "@/components/EnrolledExamCourseSelection";
 
 type LandingTab = "free" | "enrolled";
@@ -15,15 +15,15 @@ const tabButtonClass = (active: boolean) =>
 
 /**
  * Main Website Exams navigation — two-segment structure:
- * "Free Public Exams" (default) keeps the existing public category cards;
- * "Enrolled Courses Exams" hosts the existing enrolled-course exam flow.
+ * "Free Exams" (default) keeps the existing public category cards;
+ * "Courses Exams" hosts the existing enrolled-course exam flow.
  * Structural reorganization only — both systems are reused unchanged.
  */
 export default function ExamLandingTabs({
-  initialCounts,
-  initialPracticeCounts,
+  initialCategories,
   initialTab = "free",
 }: {
+  initialCategories?: CategoryCardItem[] | null;
   initialCounts?: Record<string, number> | null;
   initialPracticeCounts?: Record<string, number> | null;
   initialTab?: LandingTab;
@@ -47,7 +47,7 @@ export default function ExamLandingTabs({
             onClick={() => setTab("free")}
             className={tabButtonClass(tab === "free")}
           >
-            Free Public Exams
+            Free Exams
           </button>
           <button
             type="button"
@@ -56,20 +56,17 @@ export default function ExamLandingTabs({
             onClick={() => setTab("enrolled")}
             className={tabButtonClass(tab === "enrolled")}
           >
-            Enrolled Courses Exams
+            Courses Exams
           </button>
         </div>
       </section>
 
       {tab === "free" ? (
-        <div role="tabpanel" aria-label="Free Public Exams">
-          <ExamCategoryCards
-            initialCounts={initialCounts as never}
-            initialPracticeCounts={initialPracticeCounts as never}
-          />
+        <div role="tabpanel" aria-label="Free Exams">
+          <ExamCategoryCards initialCategories={initialCategories} />
         </div>
       ) : (
-        <div role="tabpanel" aria-label="Enrolled Courses Exams">
+        <div role="tabpanel" aria-label="Courses Exams">
           <EnrolledExamCourseSelection embedded />
         </div>
       )}

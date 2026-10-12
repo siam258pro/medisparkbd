@@ -2,9 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import ContextCard from "./ContextCard";
 import { useVisibleInterval } from "@/lib/use-visible-interval";
-import type { ExamCategory } from "@/lib/public-exams";
 
 function BookIcon() {
   return (
@@ -38,34 +36,34 @@ function BuildingIcon() {
   );
 }
 
-const categoryCards: {
-  key: ExamCategory;
-  label: string;
-  Icon: () => React.ReactElement;
-}[] = [
-  {
-    key: "ssc-academic",
-    label: "SSC Academic Exam",
-    Icon: BookIcon,
-  },
-  {
-    key: "hsc-academic",
-    label: "HSC Academic Exam",
-    Icon: GraduationCapIcon,
-  },
-  {
-    key: "medical-admission",
-    label: "Medical Admission Exam",
-    Icon: StethoscopeIcon,
-  },
-  {
-    key: "varsity-admission",
-    label: "University Admission Exam",
-    Icon: BuildingIcon,
-  },
-];
+/** Canonical slugs keep their existing icons/routes; custom categories fall back. */
+function iconForSlug(slug: string): () => React.ReactElement {
+  const token = slug.toLowerCase();
+  if (/varsity|universit/.test(token)) return BuildingIcon;
+  if (/medical/.test(token)) return StethoscopeIcon;
+  if (/hsc/.test(token)) return GraduationCapIcon;
+  if (/ssc/.test(token)) return BookIcon;
+  return BookIcon;
+}
 
-type LiveCounts = Record<ExamCategory, number>;
+/** Canonical slugs keep their legacy URL keys so existing routes keep working. */
+function routeKeyFor(slug: string): string {
+  const token = slug.toLowerCase();
+  if (token === "ssc" || token.startsWith("ssc")) return "ssc-academic";
+  if (token === "hsc" || token.startsWith("hsc")) return "hsc-academic";
+  if (token === "medical" || token.startsWith("medical")) return "medical-admission";
+  if (token === "varsity" || token.startsWith("varsity")) return "varsity-admission";
+  return slug;
+}
+
+export type CategoryCardItem = {
+  id: string;
+  slug: string;
+  name: string;
+  label: string;
+  liveCount: number;
+  practiceCount: number;
+};
 
 function formatLiveText(count: number): string {
   return `${count} ${count === 1 ? "Exam" : "Exams"} Is Live Now`;
@@ -77,63 +75,32 @@ function formatPracticeText(count: number): string {
 }
 
 /**
- * Public Exam section — 4 exam-category cards visually identical to the
- * Course Section (CategoryCard) design system: same layout, border radius,
- * spacing, typography, icon treatment, hover effect, button style and
- * responsive behavior. Only the button text differs ("Explore Exam").
- *
- * Exactly 4 categories in fixed order; routing unchanged (`${basePath}/${key}`).
- * `basePath` lets the Admin Panel reuse this exact UI with its own routes
- * (/admin/exams/public/category/…) while students keep /exam/category/….
+ * Free Exams — one card per currently ACTIVE Course Category (dynamic, never
+ * hardcoded). Card design, grid, routing into each category's Live Exam /
+ * Practice Exam segments are unchanged.
  */
 export default function ExamCategoryCards({
   basePath = "/exam/category",
-  initialCounts,
-  initialPracticeCounts,
+  initialCategories,
 }: {
   basePath?: string;
-  initialCounts?: Partial<LiveCounts> | null;
-  initialPracticeCounts?: Partial<LiveCounts> | null;
+  initialCounts?: Record<string, number> | null;
+  initialPracticeCounts?: Record<string, number> | null;
+  initialCategories?: CategoryCardItem[] | null;
 }) {
-  const [liveCounts, setLiveCounts] = useState<Record<ExamCategory, number | null>>({
-    "ssc-academic": initialCounts?.["ssc-academic"] ?? null,
-    "hsc-academic": initialCounts?.["hsc-academic"] ?? null,
-    "medical-admission": initialCounts?.["medical-admission"] ?? null,
-    "varsity-admission": initialCounts?.["varsity-admission"] ?? null,
-  });
-  const [practiceCounts, setPracticeCounts] = useState<Record<ExamCategory, number | null>>({
-    "ssc-academic": initialPracticeCounts?.["ssc-academic"] ?? null,
-    "hsc-academic": initialPracticeCounts?.["hsc-academic"] ?? null,
-    "medical-admission": initialPracticeCounts?.["medical-admission"] ?? null,
-    "varsity-admission": initialPracticeCounts?.["varsity-admission"] ?? null,
-  });
-  // Counts stay fresh silently in the background (no status UI on this page —
-  // the auto-update pill lives on the exam category pages beside the batch filter).
+  const [categories, setCategories] = useState<CategoryCardItem[] | null>(
+    initialCategories ?? null,
+  );
   const AUTO_REFRESH_MS = 60 * 1000;
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/public-exams/live-counts", { cache: "no-store" });
+      const res = await fetch("/api/public-exams/category-cards", { cache: "no-store" });
       if (!res.ok) return;
-      const data = (await res.json()) as { counts?: LiveCounts; practiceCounts?: LiveCounts };
-      if (data?.counts) {
-        setLiveCounts({
-          "ssc-academic": data.counts["ssc-academic"] ?? 0,
-          "hsc-academic": data.counts["hsc-academic"] ?? 0,
-          "medical-admission": data.counts["medical-admission"] ?? 0,
-          "varsity-admission": data.counts["varsity-admission"] ?? 0,
-        });
-      }
-      if (data?.practiceCounts) {
-        setPracticeCounts({
-          "ssc-academic": data.practiceCounts["ssc-academic"] ?? 0,
-          "hsc-academic": data.practiceCounts["hsc-academic"] ?? 0,
-          "medical-admission": data.practiceCounts["medical-admission"] ?? 0,
-          "varsity-admission": data.practiceCounts["varsity-admission"] ?? 0,
-        });
-      }
+      const data = (await res.json()) as { categories?: CategoryCardItem[] };
+      if (Array.isArray(data?.categories)) setCategories(data.categories);
     } catch {
-      // Keep previous counts on error.
+      // Keep previous categories on error.
     }
   }, []);
 
@@ -151,101 +118,105 @@ export default function ExamCategoryCards({
     };
   }, [load]);
 
-  // Visible tabs only — background tabs cost zero invocations.
   useVisibleInterval(load, AUTO_REFRESH_MS);
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6">
-      <ContextCard
-        title="Explore Public Exams"
-        instruction="তোমার পছন্দের পরীক্ষার ক্যাটাগরি নির্বাচন করো"
-      />
-
-      {/* 4 cards — same grid as Course Section: gap-6 sm:grid-cols-2 xl:grid-cols-4 */}
-      <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
-        {categoryCards.map(({ key, label, Icon }) => {
-          const count = liveCounts[key];
-          const practiceCount = practiceCounts[key];
-          return (
-          <Link
-            key={key}
-            href={`${basePath}/${key}`}
-            className="group relative flex flex-col overflow-hidden rounded-2xl border border-ink/10 bg-dark-900 p-6 shadow-lg shadow-black/20 transform-gpu will-change-transform transition duration-150 ease-out hover:-translate-y-1 hover:border-primary-600/60 hover:shadow-primary-900/30 active:scale-[0.99] touch-manipulation"
-          >
-            <div className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-primary-600/10 blur-3xl transition duration-150 ease-out group-hover:bg-primary-600/20" />
-            <div className="pointer-events-none absolute inset-0 bg-medical-dots opacity-30" />
-
-            {/* Icon on the left, exam category name beside it — same as CategoryCard */}
-            <div className="relative flex items-center gap-4">
-              <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary-600/15 text-primary-500 transition duration-150 ease-out group-hover:bg-primary-600 group-hover:text-heading group-hover:shadow-md group-hover:shadow-primary-900/50">
-                <Icon />
-              </span>
-              <h3 className="text-lg font-extrabold leading-snug text-heading transition duration-150 ease-out group-hover:text-primary-400 sm:text-xl">
-                {label}
-              </h3>
+      {categories === null ? (
+        <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4" aria-label="Loading exam categories">
+          {[0, 1, 2, 3].map((key) => (
+            <div
+              key={key}
+              className="flex flex-col rounded-2xl border border-ink/10 bg-dark-900 p-6 shadow-lg shadow-black/20"
+            >
+              <div className="flex items-center gap-4">
+                <span className="h-14 w-14 shrink-0 animate-pulse rounded-2xl bg-primary-600/15" />
+                <span className="h-6 w-2/3 animate-pulse rounded bg-dark-800" />
+              </div>
+              <p className="mt-3 text-sm font-semibold text-neutral-500">Loading...</p>
             </div>
+          ))}
+        </div>
+      ) : categories.length === 0 ? (
+        <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900/60 p-10 text-center">
+          <p className="font-semibold text-heading">No exam categories available right now</p>
+          <p className="mt-1 text-sm text-neutral-400">
+            New exam categories will appear here automatically.
+          </p>
+        </div>
+      ) : (
+        <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
+          {categories.map((category) => {
+            const Icon = iconForSlug(category.slug);
+            return (
+            <Link
+              key={category.id}
+              href={`${basePath}/${routeKeyFor(category.slug)}`}
+              className="group relative flex flex-col overflow-hidden rounded-2xl border border-ink/10 bg-dark-900 p-6 shadow-lg shadow-black/20 transform-gpu will-change-transform transition duration-150 ease-out hover:-translate-y-1 hover:border-primary-600/60 hover:shadow-primary-900/30 active:scale-[0.99] touch-manipulation"
+            >
+              <div className="pointer-events-none absolute -right-16 -top-16 h-48 w-48 rounded-full bg-primary-600/10 blur-3xl transition duration-150 ease-out group-hover:bg-primary-600/20" />
+              <div className="pointer-events-none absolute inset-0 bg-medical-dots opacity-30" />
 
-            {/* Live count (left) + practice count (right) — always one row */}
-            <div className="relative mt-3 flex items-center justify-between gap-2 text-sm font-semibold">
-              <span className="flex min-w-0 flex-1 items-center gap-2">
-              {count === null ? (
-                <>
-                  <span className="relative flex h-2.5 w-2.5 shrink-0">
-                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-neutral-500" />
-                  </span>
-                  <span className="text-neutral-500">Loading...</span>
-                </>
-              ) : count === 0 ? (
-                <>
-                  <span className="relative flex h-2.5 w-2.5 shrink-0">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500 shadow-[0_0_0_4px_rgba(239,68,68,0.18)]" />
-                  </span>
-                  <span className="text-red-400">No Exam Is Live Now</span>
-                </>
-              ) : (
-                <>
-                  <span className="relative flex h-2.5 w-2.5 shrink-0">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-blue-500 shadow-[0_0_0_4px_rgba(59,130,246,0.25)]" />
-                  </span>
-                  <span className="text-emerald-400">{formatLiveText(count)}</span>
-                </>
-              )}
-              </span>
-              {practiceCount !== null && (
+              <div className="relative flex items-center gap-4">
+                <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary-600/15 text-primary-500 transition duration-150 ease-out group-hover:bg-primary-600 group-hover:text-heading group-hover:shadow-md group-hover:shadow-primary-900/50">
+                  <Icon />
+                </span>
+                <h3 className="text-lg font-extrabold leading-snug text-heading transition duration-150 ease-out group-hover:text-primary-400 sm:text-xl">
+                  {category.label}
+                </h3>
+              </div>
+
+              <div className="relative mt-3 flex items-center justify-between gap-2 text-sm font-semibold">
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                {category.liveCount === 0 ? (
+                  <>
+                    <span className="relative flex h-2.5 w-2.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
+                      <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-red-500 shadow-[0_0_0_4px_rgba(239,68,68,0.18)]" />
+                    </span>
+                    <span className="text-red-400">No Exam Is Live Now</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="relative flex h-2.5 w-2.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+                      <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-blue-500 shadow-[0_0_0_4px_rgba(59,130,246,0.25)]" />
+                    </span>
+                    <span className="text-emerald-400">{formatLiveText(category.liveCount)}</span>
+                  </>
+                )}
+                </span>
                 <span className="min-w-0 flex-1 text-right">
-                  {practiceCount === 0 ? (
+                  {category.practiceCount === 0 ? (
                     <span className="text-neutral-400">No Practice Exams Available</span>
                   ) : (
-                    <span className="text-sky-400">{formatPracticeText(practiceCount)}</span>
+                    <span className="text-sky-400">{formatPracticeText(category.practiceCount)}</span>
                   )}
                 </span>
-              )}
-            </div>
+              </div>
 
-            {/* Same button style as CategoryCard — only text differs: Explore Exam */}
-            <div className="relative mt-auto pt-6">
-              <span className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-primary-900/40 transition duration-150 ease-out group-hover:bg-primary-700 group-hover:shadow-primary-900/60">
-                Explore Exam
-                <svg
-                  className="h-4 w-4 transition-transform duration-150 ease-out group-hover:translate-x-1"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.4"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  viewBox="0 0 24 24"
-                >
-                  <path d="M5 12h14" />
-                  <path d="m12 5 7 7-7 7" />
-                </svg>
-              </span>
-            </div>
-          </Link>
-          );
-        })}
-      </div>
+              <div className="relative mt-auto pt-6">
+                <span className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-primary-900/40 transition duration-150 ease-out group-hover:bg-primary-700 group-hover:shadow-primary-900/60">
+                  Explore Exam
+                  <svg
+                    className="h-4 w-4 transition-transform duration-150 ease-out group-hover:translate-x-1"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M5 12h14" />
+                    <path d="m12 5 7 7-7 7" />
+                  </svg>
+                </span>
+              </div>
+            </Link>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }

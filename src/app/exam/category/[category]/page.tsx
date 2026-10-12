@@ -2,40 +2,11 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import PublicExamCategoryView from "@/components/PublicExamCategoryView";
 import {
-  examCategories,
-  batches,
-  type ExamCategory,
-} from "@/lib/public-exams";
-import {
   fetchPublicExams,
-  resolveExamCategoryId,
+  resolveExamCategoryRow,
 } from "@/lib/public-exams-server";
 
-
-
 export const dynamic = "force-dynamic";
-
-const categoryMeta: Record<
-  ExamCategory,
-  { description: string }
-> = {
-  "ssc-academic": {
-    description:
-      "SSC academic model tests — live, upcoming and previous exams in one place.",
-  },
-  "hsc-academic": {
-    description:
-      "HSC academic model tests — live, upcoming and previous exams in one place.",
-  },
-  "medical-admission": {
-    description:
-      "Medical admission mock exams — live, upcoming and previous in one place.",
-  },
-  "varsity-admission": {
-    description:
-      "University admission practice exams — live, upcoming and previous in one place.",
-  },
-};
 
 type CategoryPageProps = {
   params: Promise<{ category: string }>;
@@ -45,33 +16,32 @@ export async function generateMetadata({
   params,
 }: CategoryPageProps): Promise<Metadata> {
   const { category } = await params;
-  const valid = examCategories.find((item) => item.key === category);
-  if (!valid) return { title: "Exam Category Not Found" };
-  return { title: valid.label, description: categoryMeta[valid.key].description };
+  const row = await resolveExamCategoryRow(category);
+  if (!row) return { title: "Exam Category Not Found" };
+  return { title: row.label, description: `${row.label} — live, upcoming and previous exams in one place.` };
 }
 
 export default async function ExamCategoryPage({ params }: CategoryPageProps) {
   const { category } = await params;
-  const valid = examCategories.find((item) => item.key === category);
-  if (!valid) {
+  // Legacy keys (ssc-academic …) and raw active-category slugs (including
+  // custom categories) both resolve to the real Course Control category id.
+  // Disabled/missing categories 404. Exams are fetched ONLY for that
+  // category (SQL WHERE category_id = ?).
+  const row = await resolveExamCategoryRow(category);
+  if (!row) {
     notFound();
   }
-
-  // Resolve the URL key to its real Course Control category id, then fetch
-  // ONLY that category's exams (SQL WHERE category_id = ?). Admin-created
-  // exams appear here automatically — no heuristic matching.
-  const categoryId = await resolveExamCategoryId(valid.key);
-  if (!categoryId) notFound();
-  const exams = await fetchPublicExams({ categoryId });
+  const exams = await fetchPublicExams({ categoryId: row.id });
 
   return (
     <main className="flex-1 bg-dark-950">
       {/* Category → Live Exam | Practice Exam (default: Live). */}
       <PublicExamCategoryView
-        key={valid.key}
+        key={row.id}
         exams={exams}
-        batches={batches}
-        categoryKey={valid.key}
+        batches={["HSC 26", "HSC 27", "HSC 28"]}
+        categoryKey={category}
+        categorySlug={row.slug}
         serverNowMs={Date.now()}
       />
     </main>
