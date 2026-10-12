@@ -214,6 +214,15 @@ function EmbeddedCourseExams() {
             `/api/my/course-exams?course=${encodeURIComponent(course.slug)}&live=1`,
             { cache: "no-store", headers: authHeaders, signal: controller.signal },
           );
+          // 403 = the exam gate (active enrollment + published catalog row)
+          // rejects a course that the enrolled-courses list still contains
+          // (e.g. unpublished/removed catalog row, or enrollment changed
+          // between the two requests). That course simply unlocks no exams —
+          // it must not raise the "could not load all" banner while every
+          // eligible course's exams render correctly.
+          if (response.status === 403) {
+            return { id: course.slug, exams: [] };
+          }
           const data = (await response.json()) as {
             exams?: CourseExamShortcut[];
             error?: string;
