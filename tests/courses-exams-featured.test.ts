@@ -128,23 +128,41 @@ describe("Courses Exams live listing (featured endpoint data source)", () => {
   });
 });
 
-describe("Courses Exams loading regression (90% stall)", () => {
+describe("Courses Exams enrolled-course filter (embedded listing)", () => {
   const source = readFileSync(new URL("../src/components/EnrolledExamCourseSelection.tsx", import.meta.url), "utf8");
-  it("renders the embedded listing before any auth or course-loading gate", () => {
+  it("renders the embedded listing without depending on the standalone course-loading state", () => {
     const embeddedAt = source.indexOf("if (embedded)");
     assert.ok(embeddedAt >= 0, "embedded branch must exist");
     assert.ok(
-      embeddedAt < source.indexOf("if (authLoading)"),
-      "embedded must return before the auth-loading spinner or it never renders",
-    );
-    assert.ok(
       embeddedAt < source.indexOf("if (!items && !error)"),
-      "embedded must return before the course-loading spinner: standalone load() is a no-op when embedded, so courses stays null and the spinner would park at 90% forever",
+      "embedded must return before the standalone course-loading spinner: standalone load() is a no-op when embedded, so courses stays null and the spinner would park at 90% forever",
     );
   });
-  it("shows an error with retry (not a spinner) when the live fetch fails", () => {
+  it("builds the filter from the student's own enrollments, with an All option and no hardcoding", () => {
+    // Single source of truth: the same endpoint that powers Dashboard → My
+    // Enrolled Course. Active enrollments only — pending rows unlock no exams.
+    assert.ok(source.includes('"/api/my/enrolled-courses"'), "filter options must come from the dashboard enrolled-courses endpoint");
+    assert.ok(source.includes("enrollmentStatus"), "only active enrollments may offer exams");
+    assert.ok(source.includes("All Enrolled Courses"), "filter must include an All Enrolled Courses option");
+    assert.ok(!/course-a|biology-hsc|course-[0-9]|"hsc-[0-9]+"/.test(source), "no hardcoded course ids or names in the filter");
+  });
+  it("matches exams to courses by course id through the enrollment-enforced endpoint", () => {
+    assert.ok(source.includes("/api/my/course-exams?course="), "per-course exams must load through the enrollment-gated endpoint");
+    assert.ok(source.includes("live=1"), "only currently-live exams may be requested");
+    assert.ok(source.includes("encodeURIComponent"), "course ids must be passed as ids, never matched by display name");
+    assert.ok(!source.includes("/api/courses-exams/featured"), "the unauthenticated all-courses listing must not feed the filter: unenrolled exams must never appear");
+  });
+  it("keeps the existing card design and Start Now flow", () => {
+    assert.ok(source.includes("<ExamCard"), "cards must keep reusing the shared ExamCard");
+  });
+  it("shows an error with retry (not a spinner) when loading fails", () => {
     assert.ok(source.includes('role="alert"'), "failure must render an alert");
     assert.ok(source.includes("Try Again"), "failure must offer a retry");
+  });
+  it("handles login, empty enrollments and empty live lists gracefully", () => {
+    assert.ok(source.includes("Login Required"), "logged-out students must be asked to sign in, not shown other students' exams");
+    assert.ok(source.includes("No enrolled courses yet"), "students with no active enrollment need an empty state, not a spinner");
+    assert.ok(source.includes("No live exams right now"), "a filter selection with no live exam needs an empty state");
   });
 });
 
