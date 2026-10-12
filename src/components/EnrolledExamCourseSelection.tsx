@@ -12,13 +12,6 @@ import type { CourseExamShortcut } from "@/lib/enrolled-exams-course-server";
 
 type CourseResponse = { enrolled_courses?: EnrolledExamCourse[]; error?: string };
 
-const filterPillClass = (active: boolean) =>
-  `shrink-0 rounded-xl px-4 py-2.5 text-xs font-extrabold uppercase tracking-wide touch-manipulation select-none transform-gpu transition-colors duration-75 ease-out active:scale-[0.97] sm:text-sm ${
-    active
-      ? "bg-ink text-dark-950 shadow"
-      : "text-neutral-300 hover:bg-ink/5 hover:text-heading"
-  }`;
-
 export default function EnrolledExamCourseSelection({ embedded = false }: { embedded?: boolean } = {}) {
   const { user, authLoading } = useAuth();
   const router = useRouter();
@@ -43,7 +36,7 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
   }, [user]);
 
   const load = useCallback(async () => {
-    if (!user) return;
+    if (!user || embedded) return;
     try {
       const items = await fetchCourses();
       if (currentUser.current?.uid !== user.uid || !items) return;
@@ -54,7 +47,7 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
         setError(cause instanceof Error ? cause.message : "Could not load your enrolled courses.");
       }
     }
-  }, [user, fetchCourses]);
+  }, [user, fetchCourses, embedded]);
 
   useEffect(() => {
     if (authLoading || !user) return;
@@ -96,16 +89,12 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
   const items = courses?.uid === user.uid ? courses.items : null;
   if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
-  // Courses Exams tab: enrollment-based course filters + the selected
-  // course's currently live exam only. Standalone /exam/enrolled keeps
-  // the original navigate-to-course flow unchanged.
+  // Courses Exams tab: no course filter pills — directly shows the currently
+  // live featured course exam. Standalone /exam/enrolled keeps the original
+  // navigate-to-course flow unchanged.
   if (embedded) {
     return (
-      <EmbeddedCourseExams
-        items={items ?? []}
-        error={error}
-        onRetry={() => void load()}
-      />
+      <EmbeddedCourseExams />
     );
   }
 
@@ -148,68 +137,38 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
 }
 
 /**
- * Embedded Courses Exams: one filter pill per actually-enrolled course
- * (dynamic names, never non-enrolled courses), with the selected course's
- * currently Live exam below — exclusively that course's live exam (the API
- * scopes by the selected course id via exam_courses / the chapter chain, for
- * every course layout, and ?live=1 drops Upcoming / Practice / ended rows).
- * Start Exam reuses ExamCard, preserving rules, timers, attempts, results
- * and ranking.
+ * Embedded Courses Exams: no course filter pills — directly shows the
+ * currently Live featured course exam (the existing "Physics 2nd Paper
+ * Exam 1" record from Special Medical Exam Batch) via the featured
+ * endpoint, with no course selection step. Start Exam reuses the shared
+ * ExamCard, so it opens the original exam through the unchanged exam-start
+ * flow (rules page → attempt APIs), preserving enrollment requirements,
+ * schedule, timer, attempt limits, questions and ranking. No exam, question,
+ * attempt or result records are created or modified here.
  */
-function EmbeddedCourseExams({
-  items,
-  error,
-  onRetry,
-}: {
-  items: EnrolledExamCourse[];
-  error: string | null;
-  onRetry: () => void;
-}) {
-  const { user } = useAuth();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+function EmbeddedCourseExams() {
   const [exams, setExams] = useState<CourseExamShortcut[] | null>(null);
   const [examsError, setExamsError] = useState<string | null>(null);
-  const selectedRef = useRef<string | null>(null);
-
-  const activeId = selectedId && items.some((course) => course.course_id === selectedId)
-    ? selectedId
-    : (items[0]?.course_id ?? null);
-
-  useEffect(() => {
-    selectedRef.current = activeId;
-  }, [activeId]);
 
   const loadLive = useCallback(async () => {
-    const courseId = selectedRef.current;
-    const current = user;
-    if (!current || !courseId) {
-      setExams(null);
-      return;
-    }
     try {
-      const token = await current.getIdToken();
-      const response = await fetch(`/api/my/course-exams?course=${encodeURIComponent(courseId)}&live=1`, {
+      const response = await fetch(`/api/courses-exams/featured`, {
         cache: "no-store",
-        headers: { Authorization: `Bearer ${token}` },
       });
       const data = (await response.json()) as { exams?: CourseExamShortcut[]; error?: string };
       if (!response.ok || !Array.isArray(data.exams)) {
         throw new Error(data.error ?? "Could not load course exams.");
       }
-      if (selectedRef.current !== courseId) return;
       setExams(data.exams);
       setExamsError(null);
     } catch (cause) {
-      if (selectedRef.current === courseId) {
-        setExamsError(cause instanceof Error ? cause.message : "Could not load course exams.");
-      }
+      setExamsError(cause instanceof Error ? cause.message : "Could not load course exams.");
     }
-  }, [user]);
+  }, []);
 
   useEffect(() => {
     setExams(null);
     setExamsError(null);
-    if (!activeId || !user) return;
     const initialLoad = window.setTimeout(() => void loadLive(), 0);
     const onVisible = () => { if (document.visibilityState === "visible") void loadLive(); };
     window.addEventListener("focus", onVisible);
@@ -219,100 +178,49 @@ function EmbeddedCourseExams({
       window.removeEventListener("focus", onVisible);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [activeId, user, loadLive]);
+  }, [loadLive]);
   useVisibleInterval(loadLive, 60_000);
 
-  // Main Website Courses Exams shows only the currently Live exam of the
-  // selected course. The fetch above already requests ?live=1; filter again
-  // client-side so Upcoming / Practice / ended rows can never render here
-  // even if an older cached payload arrives. The course-specific exam
-  // interface (CourseExamShortcutView) keeps its own Upcoming/Live/Practice
-  // groups unchanged.
-  const selectedCourse = items.find((course) => course.course_id === activeId) ?? null;
+  // The fetch above already returns only the currently Live featured exam;
+  // filter again client-side so Upcoming / Practice / ended rows can never
+  // render here even if an older cached payload arrives.
   const liveExams = (exams ?? []).filter((exam) => exam.status === "Live" && exam.examMode !== "practice");
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6" aria-label="Courses Exams">
-      {error && (
-        <div role="alert" className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
-          <p>{error}</p>
-          <button type="button" onClick={onRetry} className="mt-2 font-bold underline">Try Again</button>
-        </div>
-      )}
-      {items.length === 0 && !error ? (
-        <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900 p-10 text-center">
-          <h2 className="text-lg font-bold text-heading">No enrolled courses found</h2>
-          <p className="mt-2 text-sm text-neutral-400">Explore our premium courses to get started.</p>
-          <Link href="/courses?kind=paid" className="mt-6 inline-flex rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white hover:bg-primary-700">Explore Premium Courses</Link>
-        </div>
-      ) : (
-        <>
-          <div
-            role="tablist"
-            aria-label="Your enrolled courses"
-            className="flex gap-1 overflow-x-auto rounded-2xl border border-ink/10 bg-dark-900 p-1.5 shadow-lg shadow-black/20"
-          >
-            {items.map((course) => (
-              <button
-                key={course.course_id}
-                type="button"
-                role="tab"
-                aria-selected={activeId === course.course_id}
-                onClick={() => setSelectedId(course.course_id)}
-                className={`${filterPillClass(activeId === course.course_id)} min-w-0 flex-1 whitespace-nowrap`}
-                title={course.course_name}
-              >
-                <span className="block truncate">{course.course_name}</span>
-              </button>
-            ))}
+      <div className="mt-6">
+        {exams === null && !examsError ? (
+          <div className="flex flex-col items-center rounded-2xl border border-ink/10 bg-dark-900/60 p-10" role="status">
+            <div className="h-10 w-10 animate-spin rounded-full border-2 border-primary-500 border-t-transparent" />
+            <p className="mt-4 text-sm font-semibold text-neutral-400">
+              Loading live courses exams…
+            </p>
           </div>
-
-          <div className="mt-6">
-            {exams === null && !examsError ? (
-              <div className="flex flex-col items-center rounded-2xl border border-ink/10 bg-dark-900/60 p-10" role="status">
-                <div className="h-10 w-10 animate-spin rounded-full border-2 border-primary-500 border-t-transparent" />
-                <p className="mt-4 text-sm font-semibold text-neutral-400">
-                  Loading exams for {selectedCourse?.course_name ?? "your course"}…
-                </p>
-              </div>
-            ) : examsError ? (
-              <div role="alert" className="rounded-2xl border border-red-500/30 bg-red-500/10 p-8 text-center">
-                <p className="font-bold text-red-300">{examsError}</p>
-                <button type="button" onClick={() => void loadLive()} className="mt-4 rounded-xl bg-primary-600 px-6 py-3 font-semibold text-white">Try Again</button>
-              </div>
-            ) : liveExams.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900/60 p-10 text-center">
-                <p className="font-semibold text-heading">No live exams right now</p>
-                <p className="mt-1 text-sm text-neutral-400">
-                  {selectedCourse ? `There is no live exam in ${selectedCourse.course_name} right now.` : "There is no live exam right now."} Please check back later.
-                </p>
-                {selectedCourse && (
-                  <Link href={selectedCourse.direct_exam_route_url} className="mt-6 inline-flex rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white hover:bg-primary-700">Open {selectedCourse.course_name} →</Link>
-                )}
-              </div>
-            ) : (
-              <div className="space-y-8">
-                {selectedCourse && (
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-sm font-semibold text-neutral-400">
-                      Showing live exams from {selectedCourse.course_name} only
-                    </p>
-                    <Link href={selectedCourse.direct_exam_route_url} className="text-sm font-bold text-primary-400 hover:text-primary-300">Open full course exams →</Link>
-                  </div>
-                )}
-                <section aria-label="Live Now">
-                  <h2 className="text-sm font-extrabold uppercase tracking-widest text-heading">Live Now</h2>
-                  <div className="mt-3 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                    {liveExams.map((exam) => (
-                      <ExamCard key={exam.id} exam={exam} />
-                    ))}
-                  </div>
-                </section>
-              </div>
-            )}
+        ) : examsError ? (
+          <div role="alert" className="rounded-2xl border border-red-500/30 bg-red-500/10 p-8 text-center">
+            <p className="font-bold text-red-300">{examsError}</p>
+            <button type="button" onClick={() => void loadLive()} className="mt-4 rounded-xl bg-primary-600 px-6 py-3 font-semibold text-white">Try Again</button>
           </div>
-        </>
-      )}
+        ) : liveExams.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900/60 p-10 text-center">
+            <p className="font-semibold text-heading">No live exams right now</p>
+            <p className="mt-1 text-sm text-neutral-400">
+              There is no live exam right now. Please check back later.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-8">
+            <section aria-label="Live Now">
+              <h2 className="text-sm font-extrabold uppercase tracking-widest text-heading">Live Now</h2>
+              <div className="mt-3 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                {liveExams.map((exam) => (
+                  <ExamCard key={exam.id} exam={exam} />
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
+      </div>
     </section>
   );
 }

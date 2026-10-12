@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import PublicExamCategoryView from "@/components/PublicExamCategoryView";
 import {
   fetchPublicExams,
+  isEmptiedFreeExamCategory,
   resolveExamCategoryRow,
 } from "@/lib/public-exams-server";
 
@@ -31,7 +32,12 @@ export default async function ExamCategoryPage({ params }: CategoryPageProps) {
   if (!row) {
     notFound();
   }
-  const exams = await fetchPublicExams({ categoryId: row.id });
+  // Free Exams display-only gate: the Medical Admission and HSC Academic
+  // category cards stay visible, but their listings render empty. The exam
+  // records in the database are untouched.
+  const exams = isEmptiedFreeExamCategory(row)
+    ? []
+    : await fetchPublicExams({ categoryId: row.id });
 
   return (
     <main className="flex-1 bg-dark-950">

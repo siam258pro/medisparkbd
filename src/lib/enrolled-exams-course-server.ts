@@ -143,3 +143,26 @@ export async function fetchFreshCourseExamShortcuts(
   }
   return shortcuts;
 }
+
+/**
+ * Featured Courses Exams spotlight (display-only, no database changes).
+ * Verified live record: id "exam-d9h1gf16" ("Physics 2nd Paper Exam 1",
+ * kind = enrolled, exam_mode = live, window 2026-10-11 → 2026-10-13),
+ * linked to course "specialmedicalexambatch" via exam_courses.
+ * Reuses fetchFreshCourseExamShortcuts with liveOnly so the exam appears
+ * here only while it is actually Live; otherwise this returns [] and the
+ * section shows its empty state. The returned shortcut reuses the existing
+ * exam id, so Start Exam opens the original exam through the unchanged
+ * exam-start flow (rules page → attempt APIs), preserving enrollment,
+ * schedule, timer, attempt limits, questions and ranking.
+ */
+export const FEATURED_COURSES_EXAM_ID = "exam-d9h1gf16";
+const FEATURED_COURSES_EXAM_COURSE_ID = "specialmedicalexambatch";
+
+export async function fetchFeaturedCoursesLiveExam(): Promise<CourseExamShortcut[]> {
+  const live = await fetchFreshCourseExamShortcuts(
+    FEATURED_COURSES_EXAM_COURSE_ID,
+    { liveOnly: true },
+  );
+  return live.filter((exam) => exam.id === FEATURED_COURSES_EXAM_ID);
+}
