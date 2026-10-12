@@ -97,7 +97,7 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
   if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
   // Courses Exams tab: enrollment-based course filters + the selected
-  // course's exams (all phases). Standalone /exam/enrolled keeps
+  // course's currently live exam only. Standalone /exam/enrolled keeps
   // the original navigate-to-course flow unchanged.
   if (embedded) {
     return (
@@ -150,9 +150,9 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
 /**
  * Embedded Courses Exams: one filter pill per actually-enrolled course
  * (dynamic names, never non-enrolled courses), with the selected course's
- * exams below — exclusively that course's exams (the API scopes by the
- * selected course id via exam_courses / the chapter chain, for every course
- * layout). All phases render (Live Now / Upcoming / Practice groups);
+ * currently Live exam below — exclusively that course's live exam (the API
+ * scopes by the selected course id via exam_courses / the chapter chain, for
+ * every course layout, and ?live=1 drops Upcoming / Practice / ended rows).
  * Start Exam reuses ExamCard, preserving rules, timers, attempts, results
  * and ranking.
  */
@@ -188,7 +188,7 @@ function EmbeddedCourseExams({
     }
     try {
       const token = await current.getIdToken();
-      const response = await fetch(`/api/my/course-exams?course=${encodeURIComponent(courseId)}`, {
+      const response = await fetch(`/api/my/course-exams?course=${encodeURIComponent(courseId)}&live=1`, {
         cache: "no-store",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -222,15 +222,14 @@ function EmbeddedCourseExams({
   }, [activeId, user, loadLive]);
   useVisibleInterval(loadLive, 60_000);
 
-  // All of the selected course's exams, grouped by the existing
-  // schedule/status phases. The list stays strictly per-course: every fetch
-  // is scoped to the active filter pill's course id.
+  // Main Website Courses Exams shows only the currently Live exam of the
+  // selected course. The fetch above already requests ?live=1; filter again
+  // client-side so Upcoming / Practice / ended rows can never render here
+  // even if an older cached payload arrives. The course-specific exam
+  // interface (CourseExamShortcutView) keeps its own Upcoming/Live/Practice
+  // groups unchanged.
   const selectedCourse = items.find((course) => course.course_id === activeId) ?? null;
-  const groups = [
-    { status: "Live", title: "Live Now" },
-    { status: "Upcoming", title: "Upcoming" },
-    { status: "Archived", title: "Practice" },
-  ] as const;
+  const liveExams = (exams ?? []).filter((exam) => exam.status === "Live" && exam.examMode !== "practice");
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6" aria-label="Courses Exams">
@@ -281,11 +280,11 @@ function EmbeddedCourseExams({
                 <p className="font-bold text-red-300">{examsError}</p>
                 <button type="button" onClick={() => void loadLive()} className="mt-4 rounded-xl bg-primary-600 px-6 py-3 font-semibold text-white">Try Again</button>
               </div>
-            ) : (exams ?? []).length === 0 ? (
+            ) : liveExams.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900/60 p-10 text-center">
-                <p className="font-semibold text-heading">No exams in this course yet</p>
+                <p className="font-semibold text-heading">No live exams right now</p>
                 <p className="mt-1 text-sm text-neutral-400">
-                  {selectedCourse ? `There are no published exams in ${selectedCourse.course_name} right now.` : "There are no published exams right now."} Please check back later.
+                  {selectedCourse ? `There is no live exam in ${selectedCourse.course_name} right now.` : "There is no live exam right now."} Please check back later.
                 </p>
                 {selectedCourse && (
                   <Link href={selectedCourse.direct_exam_route_url} className="mt-6 inline-flex rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white hover:bg-primary-700">Open {selectedCourse.course_name} →</Link>
@@ -296,25 +295,19 @@ function EmbeddedCourseExams({
                 {selectedCourse && (
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <p className="text-sm font-semibold text-neutral-400">
-                      Showing exams from {selectedCourse.course_name} only
+                      Showing live exams from {selectedCourse.course_name} only
                     </p>
                     <Link href={selectedCourse.direct_exam_route_url} className="text-sm font-bold text-primary-400 hover:text-primary-300">Open full course exams →</Link>
                   </div>
                 )}
-                {groups.map((group) => {
-                  const groupExams = (exams ?? []).filter((exam) => exam.status === group.status);
-                  if (groupExams.length === 0) return null;
-                  return (
-                    <section key={group.status} aria-label={group.title}>
-                      <h2 className="text-sm font-extrabold uppercase tracking-widest text-heading">{group.title}</h2>
-                      <div className="mt-3 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                        {groupExams.map((exam) => (
-                          <ExamCard key={exam.id} exam={exam} />
-                        ))}
-                      </div>
-                    </section>
-                  );
-                })}
+                <section aria-label="Live Now">
+                  <h2 className="text-sm font-extrabold uppercase tracking-widest text-heading">Live Now</h2>
+                  <div className="mt-3 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                    {liveExams.map((exam) => (
+                      <ExamCard key={exam.id} exam={exam} />
+                    ))}
+                  </div>
+                </section>
               </div>
             )}
           </div>

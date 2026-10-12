@@ -40,8 +40,14 @@ function toIso(value: Date | string | null): string | null {
 /** Course selector based on fetchPublishedCourseExams, with strict hierarchy
  * isolation and fresh reads. That existing selector's shared-subject join does
  * not constrain chapter.course_slug and can include another course's chapter.
- * Deliberately select metadata only — no answers, attempts or full catalog. */
-export async function fetchFreshCourseExamShortcuts(courseId: string): Promise<CourseExamShortcut[]> {
+ * Deliberately select metadata only — no answers, attempts or full catalog.
+ * Pass { liveOnly: true } for the Main Website Courses Exams section, which
+ * shows only the currently Live exam (no Upcoming / Practice / ended rows).
+ * The course-specific exam interface uses the default (all phases). */
+export async function fetchFreshCourseExamShortcuts(
+  courseId: string,
+  options: { liveOnly?: boolean } = {},
+): Promise<CourseExamShortcut[]> {
   const rows = await query<CourseExamRow[]>(
     `SELECT ex.id, ex.title, ex.description, ex.banner_url, ex.exam_mode,
             ex.batch_id, ex.subject, ex.course_type, ex.duration_minutes,
@@ -90,7 +96,7 @@ export async function fetchFreshCourseExamShortcuts(courseId: string): Promise<C
   );
   const totalsById = new Map(totals.map((row) => [row.exam_id, row]));
   const now = Date.now();
-  return rows.map((row) => {
+  const shortcuts: CourseExamShortcut[] = rows.map((row) => {
     const scheduledAt = toIso(row.scheduled_at);
     const endsAt = toIso(row.ends_at);
     const phase = getEnrolledExamPhase({ status: "published", scheduledAt, endsAt }, now);
@@ -127,4 +133,13 @@ export async function fetchFreshCourseExamShortcuts(courseId: string): Promise<C
       eligibility: { mode: "all", rules: [] },
     };
   });
+  // Main Website Courses Exams: only the currently Live exam. Live means the
+  // enrolled lifecycle phase is live (unscheduled no-window rows count as
+  // Live, matching the course interface) and the exam is not a static
+  // Practice-mode exam. Upcoming, Practice/archived and ended rows are
+  // excluded here; the course-specific exam interface keeps all phases.
+  if (options.liveOnly) {
+    return shortcuts.filter((exam) => exam.status === "Live" && exam.examMode !== "practice");
+  }
+  return shortcuts;
 }

@@ -28,7 +28,11 @@ export async function GET(request: NextRequest) {
     // course's exam_courses / chapter-chain linkage) and nothing else.
     // Flow-specific dashboard pages (flow4-exams, exam-flow) keep their own
     // content models; this endpoint is the per-course exam shortcut list.
-    const exams = await fetchFreshCourseExamShortcuts(slug);
+    // ?live=1 restricts to the currently Live exam for the Main Website
+    // Courses Exams section (Upcoming / Practice / ended excluded). The
+    // course-specific exam interface omits the flag and keeps all phases.
+    const liveOnly = request.nextUrl.searchParams.get("live") === "1";
+    const exams = await fetchFreshCourseExamShortcuts(slug, { liveOnly });
     return NextResponse.json({ course, exams }, { headers });
   } catch (error) {
     console.error("[api/my/course-exams] failed:", error);
