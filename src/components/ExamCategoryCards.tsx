@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import ContextCard from "./ContextCard";
-import EnrolledExamShortcut from "@/components/EnrolledExamShortcut";
 import { useVisibleInterval } from "@/lib/use-visible-interval";
 import type { ExamCategory } from "@/lib/public-exams";
 
@@ -161,8 +160,6 @@ export default function ExamCategoryCards({
         title="Explore Public Exams"
         instruction="তোমার পছন্দের পরীক্ষার ক্যাটাগরি নির্বাচন করো"
       />
-
-      {basePath === "/exam/category" && <EnrolledExamShortcut />}
 
       {/* 4 cards — same grid as Course Section: gap-6 sm:grid-cols-2 xl:grid-cols-4 */}
       <div className="grid gap-6 sm:grid-cols-2 xl:grid-cols-4">

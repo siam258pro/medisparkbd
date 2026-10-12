@@ -10,7 +10,7 @@ import type { EnrolledExamCourse } from "@/lib/enrolled-exams";
 
 type CourseResponse = { enrolled_courses?: EnrolledExamCourse[]; error?: string };
 
-export default function EnrolledExamCourseSelection() {
+export default function EnrolledExamCourseSelection({ embedded = false }: { embedded?: boolean } = {}) {
   const { user, authLoading } = useAuth();
   const router = useRouter();
   const currentUser = useRef(user);
@@ -88,9 +88,11 @@ export default function EnrolledExamCourseSelection() {
   if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
   return (
-    <section className="mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-12">
-      <Link href="/exam" className="text-sm font-semibold text-primary-400 hover:text-primary-300">← Explore Public Exams</Link>
-      <h1 className="mt-5 text-2xl font-extrabold text-heading sm:text-3xl">My Enrolled Exams</h1>
+    <section className={`mx-auto max-w-6xl px-4 sm:px-6 ${embedded ? "py-4" : "py-8 sm:py-12"}`}>
+      {embedded ? null : (
+        <Link href="/exam" className="text-sm font-semibold text-primary-400 hover:text-primary-300">← Explore Public Exams</Link>
+      )}
+      <h1 className={`${embedded ? "mt-0" : "mt-5"} text-2xl font-extrabold text-heading sm:text-3xl`}>My Enrolled Exams</h1>
       <p className="mt-2 text-sm text-neutral-400">Choose a course to go directly to its exams.</p>
       {error && <div role="alert" className="mt-6 rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-300">
         <p>{error}</p>
