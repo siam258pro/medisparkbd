@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import ExamLandingTabs from "@/components/ExamLandingTabs";
+import { fetchPublicExamCategoryCards } from "@/lib/public-exams-server";
 
 export const dynamic = "force-dynamic";
 
@@ -21,14 +22,17 @@ export default async function ExamPage({
 }: {
   searchParams?: Promise<{ tab?: string }>;
 }) {
-  // Free Exams cards are temporarily hidden (display-only). No Public Exam
-  // records are modified — the category-cards API, category pages, and
-  // Admin Panel keep reading the same database. To restore, re-fetch
-  // fetchPublicExamCategoryCards() and pass it as initialCategories.
+  // A database outage must not render a misleading zero inventory or make
+  // the landing page unavailable; the client retries the fresh API.
+  const initialCategories = await fetchPublicExamCategoryCards().catch((error: unknown) => {
+    console.error("[exam] could not load category cards:", error);
+    return null;
+  });
   const tab = (await searchParams)?.tab === "enrolled" ? "enrolled" : "free";
   return (
     <main className="flex-1 bg-dark-950">
       <ExamLandingTabs
+        initialCategories={initialCategories}
         initialTab={tab}
       />
     </main>
