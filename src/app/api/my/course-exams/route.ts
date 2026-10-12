@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getFirebaseUser } from "@/lib/auth-api";
 import { isMysqlConfigured } from "@/lib/mysql";
-import { resolveDirectExamRoute } from "@/lib/enrolled-exams";
 import { getMyEnrolledExamCourse } from "@/lib/enrolled-exams-server";
 import { fetchFreshCourseExamShortcuts } from "@/lib/enrolled-exams-course-server";
 
@@ -23,11 +22,13 @@ export async function GET(request: NextRequest) {
         { status: 403, headers },
       );
     }
-    // A bookmarked legacy section may now belong to another layout. Return
-    // fresh routing metadata without loading the wrong content model.
-    const exams = course.direct_exam_route_url === resolveDirectExamRoute(slug, "flow-1")
-      ? await fetchFreshCourseExamShortcuts(slug)
-      : [];
+    // Courses Exams serves EVERY course layout (flow-1/2 legacy, flow-4,
+    // flow-5 and any future layout): the selector below is layout-agnostic —
+    // it returns this course's exams-table exams (kind = enrolled + this
+    // course's exam_courses / chapter-chain linkage) and nothing else.
+    // Flow-specific dashboard pages (flow4-exams, exam-flow) keep their own
+    // content models; this endpoint is the per-course exam shortcut list.
+    const exams = await fetchFreshCourseExamShortcuts(slug);
     return NextResponse.json({ course, exams }, { headers });
   } catch (error) {
     console.error("[api/my/course-exams] failed:", error);

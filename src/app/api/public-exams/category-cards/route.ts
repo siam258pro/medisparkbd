@@ -49,6 +49,8 @@ export async function GET() {
         FROM exams
         WHERE kind IN ('public', 'practice') AND status = 'published'
           AND COALESCE(archived, 0) = 0
+          AND chapter_id IS NULL AND exam_format IS NULL
+          AND NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)
         GROUP BY category_id`,
         [now, now, now, now],
         { cache: false },

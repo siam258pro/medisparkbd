@@ -267,8 +267,11 @@ export default function ExamManager({
         // Database/API-level isolation — only this category's exams, both
         // live-mode (kind public) and practice exams (legacy kind practice
         // or exam_mode practice) so the Live/Practice structure matches the
-        // Main Website. Course (enrolled) exams stay excluded.
+        // Main Website. The PUBLIC scope additionally excludes every course
+        // relationship, so this list is exactly what Free Exams shows.
+        // Course (enrolled) exams stay excluded.
         params.set("kind", "public,practice");
+        params.set("scope", "PUBLIC");
         params.set("categoryId", fixedCategory.id);
         if (fixedChapter) params.set("chapterId", fixedChapter.id);
       } else if (fixedCourse) {
@@ -574,8 +577,12 @@ export default function ExamManager({
           scheduledAt: form.scheduledAt ? new Date(form.scheduledAt).toISOString() : null,
           endsAt: form.endsAt ? new Date(form.endsAt).toISOString() : null,
           bannerUrl: form.bannerUrl || null,
-          chapterId,
-          categoryId: isPublicScope ? categoryId : (existing?.categoryId ?? null),
+          chapterId: isPublicScope ? null : chapterId,
+          // Strict source separation: PUBLIC exams keep the fixed category
+          // and no course linkage; COURSE exams keep the course linkage and
+          // no Public Exam Control category (never preserve the other
+          // scope's relationship from a previous save).
+          categoryId: isPublicScope ? categoryId : null,
           courseIds: isPublicScope ? [] : fixedCourse ? [fixedCourse.slug] : (existing?.courseIds ?? courseIds),
           ruleTemplate: tpl || (isPublicScope ? detectTemplateForCategory(fixedCategory!) : "academic"),
           questionCount: qc,
@@ -583,8 +590,11 @@ export default function ExamManager({
           totalMarks: total,
           // Course-exam Flow-5 locks ride along so branches never mix; new
           // chapter/legacy course exams keep NULL (legacy flow) via existing.
+          // PUBLIC scope never carries a Flow-5 format (Course Content
+          // Control only) — send explicit nulls so a repurposed exam cannot
+          // keep its old course-exam category.
           ...(isPublicScope
-            ? {}
+            ? { examFormat: null, topicSubject: null }
             : {
                 examFormat: fixedFormat ?? existing?.examFormat ?? null,
                 topicSubject: (fixedFormat === "topic-wise" || (existing?.examFormat ?? null) === "topic-wise")
@@ -598,14 +608,19 @@ export default function ExamManager({
           ...(editingSortOrder !== null ? { sortOrder: editingSortOrder } : {}),
         };
       } else {
+        const legacyIsCourse = effectiveKind === "enrolled";
         payload = {
           ...form,
           kind: effectiveKind,
           id: examId,
           ...(editingSortOrder !== null ? { sortOrder: editingSortOrder } : {}),
-          chapterId,
-          courseIds: effectiveKind === "enrolled" ? effectiveCourseIds : [],
-          categoryId,
+          // Legacy flat lists share one form for both scopes: never let a
+          // public exam keep course linkage (or vice versa) from the form.
+          chapterId: legacyIsCourse ? chapterId : null,
+          courseIds: legacyIsCourse ? effectiveCourseIds : [],
+          categoryId: legacyIsCourse ? null : categoryId,
+          examFormat: legacyIsCourse ? (form as unknown as { examFormat?: string }).examFormat ?? null : null,
+          topicSubject: legacyIsCourse ? (form as unknown as { topicSubject?: string }).topicSubject ?? null : null,
           bannerUrl: form.bannerUrl,
           negativeEnabled: form.negativeEnabled,
           negativePerWrong: Number(form.negativePerWrong) || 0.25,

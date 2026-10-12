@@ -69,6 +69,8 @@ function toPublicExam(exam: Exam): PublicExam {
 /**
  * Live exam catalog for the public site — reads published/closed exams
  * straight from MySQL so admin-panel edits show up immediately.
+ * Strict PUBLIC scope (Public Exam Control only): kind plus the absence of
+ * every course relationship (chapter, direct assignment, Flow-5 format).
  * Enrolled exams are excluded — they are gated by course enrollment.
  * Pass categoryId to get ONLY one Public Exam Control category's exams
  * (SQL-level WHERE category_id = ? — same records as the Admin Panel).
@@ -79,8 +81,8 @@ export async function fetchFreshPublicExams(
   const { isPublicLiveHidden } = await import("@/lib/exam-lifecycle");
   const exams = options.categoryId
     ? await fetchPublishedPublicExams(options.categoryId)
-    : await fetchExams().then((all) =>
-        all.filter((exam) => exam.status !== "draft" && exam.kind !== "enrolled"),
+    : await fetchExams({ scope: "PUBLIC", archived: false }).then((all) =>
+        all.filter((exam) => exam.status !== "draft"),
       );
   // Public Live Exams hidden 12h after End disappear from the Main Website
   // list (kept in DB + Admin Panel). Practice exams are never hidden by time.
@@ -153,13 +155,11 @@ export const fetchExamPageById = cache((id: string): Promise<PublicExam | null> 
  * Same MySQL data as the main website; nothing is hardcoded.
  */
 export async function fetchAdminPublicExams(): Promise<PublicExam[]> {
-  const exams = await fetchExams();
-  return exams
-    .filter((exam) => exam.kind !== "enrolled")
-    .map((exam) => ({
-      ...toPublicExam(exam),
-      published: exam.status !== "draft",
-    }));
+  const exams = await fetchExams({ scope: "PUBLIC" });
+  return exams.map((exam) => ({
+    ...toPublicExam(exam),
+    published: exam.status !== "draft",
+  }));
 }
 
 type ExamCounts = Record<ExamCategory, number>;
@@ -182,6 +182,9 @@ type ExamCountRow = {
  * published PUBLIC scope as fetchPublishedPublicExams. Static practice (also
  * legacy kind=practice) is always available; published live exams become
  * practice at End Time, after Start Time, just like getPublicLiveState.
+ * Course-linked exams (chapter, direct assignment, Flow-5 format) never
+ * count here even when their kind is public — ownership is the module
+ * relationship, not the kind label alone.
  * Bypass every persistent cache, including mysql.query's default SELECT cache.
  */
 export async function fetchPublicExamCounts(): Promise<{
@@ -210,6 +213,8 @@ export async function fetchPublicExamCounts(): Promise<{
        FROM exams
        WHERE kind IN ('public', 'practice') AND status = 'published'
          AND COALESCE(archived, 0) = 0
+         AND chapter_id IS NULL AND exam_format IS NULL
+         AND NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)
        GROUP BY category_id`,
       [now, now, now, now],
       { cache: false },
@@ -269,8 +274,9 @@ export type PublicExamCategoryCard = {
 
 /**
  * Dynamic Free Exams inventory — one entry per ACTIVE Course Category.
- * Same published PUBLIC scope as fetchPublicExamCounts. No hardcoded list:
- * disabling a category hides it, re-enabling shows it again.
+ * Same strict published PUBLIC scope as fetchPublicExamCounts (no
+ * course-linked exams). No hardcoded list: disabling a category hides it,
+ * re-enabling shows it again.
  */
 export async function fetchPublicExamCategoryCards(): Promise<PublicExamCategoryCard[]> {
   const { examCategoryLabel } = await import("@/lib/public-exams");
@@ -297,6 +303,8 @@ export async function fetchPublicExamCategoryCards(): Promise<PublicExamCategory
         FROM exams
         WHERE kind IN ('public', 'practice') AND status = 'published'
           AND COALESCE(archived, 0) = 0
+          AND chapter_id IS NULL AND exam_format IS NULL
+          AND NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)
         GROUP BY category_id`,
       [now, now, now, now],
       { cache: false },

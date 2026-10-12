@@ -283,7 +283,7 @@ describe("authenticated, fresh course exam shortcut API", () => {
     assert.equal((await payload(await f.get("other"), 403)).error, "This course is unavailable or you are not actively enrolled.");
   });
 
-  it("returns fresh redirect metadata after layout changes without reading the wrong model", async (t) => {
+  it("returns fresh exam metadata after layout changes for every course layout", async (t) => {
     const f = fixture(); t.after(() => f.db.close());
     f.addExam("exam"); f.assign("exam");
     await payload(await f.get());
@@ -293,8 +293,10 @@ describe("authenticated, fresh course exam shortcut API", () => {
       const data = await payload(await f.get());
       assert.equal(data.course.course_name, "Renamed"); assert.equal(data.course.banner_image_url, "/fresh.png");
       assert.equal(data.course.direct_exam_route_url, `/dashboard/enrolled-courses/own/${suffix}`);
-      assert.equal(f.queries.length - before, layout === "flow-2" ? 3 : 1);
-      assert.equal(data.exams.length, layout === "flow-2" ? 1 : 0);
+      // Courses Exams serves every layout: the selected enrolled course's
+      // exams come back regardless of content layout (enrollment gate first).
+      assert.equal(f.queries.length - before, 3);
+      assert.equal(data.exams.length, 1);
     }
   });
 

@@ -97,11 +97,11 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
   if (!items && !error) return <AccessLoading label="Loading enrolled courses…" />;
 
   // Courses Exams tab: enrollment-based course filters + the selected
-  // course's genuinely Live exams only. Standalone /exam/enrolled keeps
+  // course's exams (all phases). Standalone /exam/enrolled keeps
   // the original navigate-to-course flow unchanged.
   if (embedded) {
     return (
-      <EmbeddedCourseLiveExams
+      <EmbeddedCourseExams
         items={items ?? []}
         error={error}
         onRetry={() => void load()}
@@ -150,13 +150,13 @@ export default function EnrolledExamCourseSelection({ embedded = false }: { embe
 /**
  * Embedded Courses Exams: one filter pill per actually-enrolled course
  * (dynamic names, never non-enrolled courses), with the selected course's
- * currently-running Live exams below. Live status comes from the existing
- * course-exam schedule/status logic (server-derived `status === "Live"`);
- * Upcoming, Practice/Archived and expired exams never render here. Start
- * Exam reuses ExamCard, preserving rules, timers, attempts, results and
- * ranking.
+ * exams below — exclusively that course's exams (the API scopes by the
+ * selected course id via exam_courses / the chapter chain, for every course
+ * layout). All phases render (Live Now / Upcoming / Practice groups);
+ * Start Exam reuses ExamCard, preserving rules, timers, attempts, results
+ * and ranking.
  */
-function EmbeddedCourseLiveExams({
+function EmbeddedCourseExams({
   items,
   error,
   onRetry,
@@ -194,14 +194,14 @@ function EmbeddedCourseLiveExams({
       });
       const data = (await response.json()) as { exams?: CourseExamShortcut[]; error?: string };
       if (!response.ok || !Array.isArray(data.exams)) {
-        throw new Error(data.error ?? "Could not load live exams.");
+        throw new Error(data.error ?? "Could not load course exams.");
       }
       if (selectedRef.current !== courseId) return;
       setExams(data.exams);
       setExamsError(null);
     } catch (cause) {
       if (selectedRef.current === courseId) {
-        setExamsError(cause instanceof Error ? cause.message : "Could not load live exams.");
+        setExamsError(cause instanceof Error ? cause.message : "Could not load course exams.");
       }
     }
   }, [user]);
@@ -222,9 +222,15 @@ function EmbeddedCourseLiveExams({
   }, [activeId, user, loadLive]);
   useVisibleInterval(loadLive, 60_000);
 
-  // Only genuinely Live exams per the existing schedule/status logic.
-  const liveExams = (exams ?? []).filter((exam) => exam.status === "Live");
+  // All of the selected course's exams, grouped by the existing
+  // schedule/status phases. The list stays strictly per-course: every fetch
+  // is scoped to the active filter pill's course id.
   const selectedCourse = items.find((course) => course.course_id === activeId) ?? null;
+  const groups = [
+    { status: "Live", title: "Live Now" },
+    { status: "Upcoming", title: "Upcoming" },
+    { status: "Archived", title: "Practice" },
+  ] as const;
 
   return (
     <section className="mx-auto max-w-6xl px-4 py-4 sm:px-6" aria-label="Courses Exams">
@@ -267,7 +273,7 @@ function EmbeddedCourseLiveExams({
               <div className="flex flex-col items-center rounded-2xl border border-ink/10 bg-dark-900/60 p-10" role="status">
                 <div className="h-10 w-10 animate-spin rounded-full border-2 border-primary-500 border-t-transparent" />
                 <p className="mt-4 text-sm font-semibold text-neutral-400">
-                  Loading live exams for {selectedCourse?.course_name ?? "your course"}…
+                  Loading exams for {selectedCourse?.course_name ?? "your course"}…
                 </p>
               </div>
             ) : examsError ? (
@@ -275,18 +281,40 @@ function EmbeddedCourseLiveExams({
                 <p className="font-bold text-red-300">{examsError}</p>
                 <button type="button" onClick={() => void loadLive()} className="mt-4 rounded-xl bg-primary-600 px-6 py-3 font-semibold text-white">Try Again</button>
               </div>
-            ) : liveExams.length === 0 ? (
+            ) : (exams ?? []).length === 0 ? (
               <div className="rounded-2xl border border-dashed border-ink/15 bg-dark-900/60 p-10 text-center">
-                <p className="font-semibold text-heading">No live exam right now</p>
+                <p className="font-semibold text-heading">No exams in this course yet</p>
                 <p className="mt-1 text-sm text-neutral-400">
-                  {selectedCourse ? `There is no currently running live exam in ${selectedCourse.course_name}.` : "There is no currently running live exam."} Please check back later.
+                  {selectedCourse ? `There are no published exams in ${selectedCourse.course_name} right now.` : "There are no published exams right now."} Please check back later.
                 </p>
+                {selectedCourse && (
+                  <Link href={selectedCourse.direct_exam_route_url} className="mt-6 inline-flex rounded-xl bg-primary-600 px-6 py-3 text-sm font-bold text-white hover:bg-primary-700">Open {selectedCourse.course_name} →</Link>
+                )}
               </div>
             ) : (
-              <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                {liveExams.map((exam) => (
-                  <ExamCard key={exam.id} exam={exam} />
-                ))}
+              <div className="space-y-8">
+                {selectedCourse && (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-semibold text-neutral-400">
+                      Showing exams from {selectedCourse.course_name} only
+                    </p>
+                    <Link href={selectedCourse.direct_exam_route_url} className="text-sm font-bold text-primary-400 hover:text-primary-300">Open full course exams →</Link>
+                  </div>
+                )}
+                {groups.map((group) => {
+                  const groupExams = (exams ?? []).filter((exam) => exam.status === group.status);
+                  if (groupExams.length === 0) return null;
+                  return (
+                    <section key={group.status} aria-label={group.title}>
+                      <h2 className="text-sm font-extrabold uppercase tracking-widest text-heading">{group.title}</h2>
+                      <div className="mt-3 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+                        {groupExams.map((exam) => (
+                          <ExamCard key={exam.id} exam={exam} />
+                        ))}
+                      </div>
+                    </section>
+                  );
+                })}
               </div>
             )}
           </div>

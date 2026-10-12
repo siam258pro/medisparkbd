@@ -813,10 +813,18 @@ export async function fetchExams(
       params.push(...kinds);
     }
     // Unified scope filter — derived from kind (single engine, no split tables).
+    // PUBLIC scope additionally excludes every course relationship
+    // (chapter linkage, direct course assignment, Flow-5 format): Free Exams
+    // must contain only Public Exam Control data, never course exams.
     if (filters.scope === "COURSE") {
       where.push(`kind = 'enrolled'`);
     } else if (filters.scope === "PUBLIC") {
       where.push(`kind <> 'enrolled'`);
+      where.push(`chapter_id IS NULL`);
+      where.push(`exam_format IS NULL`);
+      where.push(
+        `NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)`,
+      );
     }
     if (filters.ids?.length) {
       where.push(`id IN (${filters.ids.map(() => "?").join(",")})`);
@@ -974,17 +982,30 @@ export async function saveExam(
   const scope: ExamScope = kind === "enrolled" ? "COURSE" : "PUBLIC";
   const rawExamMode = asString((input as Record<string, unknown>).examMode) || asString((input as Record<string, unknown>).exam_mode as string);
   const examMode: ExamMode = rawExamMode === "practice" ? "practice" : "live";
-  const courseIds = Array.isArray(input.courseIds)
+  let courseIds = Array.isArray(input.courseIds)
     ? Array.from(new Set(input.courseIds.map(String).map((value) => value.trim()).filter(Boolean)))
     : [];
-  const chapterId = asString(input.chapterId) || null;
+  let chapterId = asString(input.chapterId) || null;
+  // Strict source separation (Free vs Course exams): a PUBLIC exam must
+  // never carry course linkage (chapter / direct assignment), and a COURSE
+  // exam must never carry a Public Exam Control category. Stale
+  // cross-linkage would otherwise leak exams into the wrong website segment.
+  if (scope === "PUBLIC") {
+    chapterId = null;
+    courseIds = [];
+  }
   // COURSE scope must stay linked to a course: direct exam_courses assignment
   // OR the chapter → subject → course chain. Chapter-linked course exams keep
   // working without a direct assignment (backward compatible, no data loss).
   if (kind === "enrolled" && courseIds.length === 0 && !chapterId) {
     throw new Error("Assign at least one course to a course exam.");
   }
-  const categoryId = asString(input.categoryId) || null;
+  // COURSE exams keep no Public Exam Control category (see separation note
+  // above) — the course linkage alone owns them.
+  let categoryId = asString(input.categoryId) || null;
+  if (scope === "COURSE") {
+    categoryId = null;
+  }
   // ── Rule template auto-detection ──
   let ruleTemplate = asString((input as Record<string, unknown>).ruleTemplate) || asString((input as Record<string, unknown>).rule_template as string) || "";
   if (!ruleTemplate) {
@@ -1125,6 +1146,12 @@ export async function saveExam(
     const rawTopicSubject = asString(input.topicSubject ?? (input as Record<string, unknown>).topic_subject);
     topicSubject = examFormat === "topic-wise" && rawTopicSubject ? rawTopicSubject.slice(0, 64) : null;
   } else if (examFormat !== "topic-wise") {
+    topicSubject = null;
+  }
+  // Flow-5 formats belong to Course Content Control only — a PUBLIC exam
+  // never keeps one (prevents course-exam leakage into Free Exams).
+  if (scope === "PUBLIC") {
+    examFormat = null;
     topicSubject = null;
   }
   // The exam lock, dependent reads, and writes share one transaction.
@@ -2002,10 +2029,15 @@ export async function hasEnrolledExamAccess(
 export async function fetchFeaturedPublicExams(): Promise<Exam[]> {
   try {
     await ensureTables();
+    // Homepage slider is a public surface — same strict PUBLIC scope as the
+    // Free Exams listing (never a course-linked exam).
     const rows = await query<ExamRow[]>(
       `SELECT ${EXAM_COLUMNS} FROM exams
-       WHERE featured = 1 AND status = 'published' AND kind = 'public'
-       ORDER BY sort_order ASC, created_at DESC`,
+        WHERE featured = 1 AND status = 'published' AND kind = 'public'
+          AND chapter_id IS NULL AND exam_format IS NULL
+          AND COALESCE(archived, 0) = 0
+          AND NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)
+        ORDER BY sort_order ASC, created_at DESC`,
     );
     return await applyLiveTotals(rows.map(rowToExam));
   } catch {
@@ -2014,11 +2046,12 @@ export async function fetchFeaturedPublicExams(): Promise<Exam[]> {
 }
 
 /**
- * Published public exams for the Main Website, optionally scoped to ONE
- * Public Exam Control category (SQL-level WHERE category_id = ?). This is
- * the shared Admin Panel → Database → Main Website relationship: an exam
- * created under a category in Public Exam Control appears under that same
- * category on the website automatically.
+ * Published PUBLIC-scope exams for the Main Website (Free Exams),
+ * optionally scoped to ONE Public Exam Control category (SQL-level WHERE
+ * category_id = ?). Ownership is the actual module relationship, never a
+ * name/title heuristic: only exams with NO course linkage (no chapter, no
+ * direct course assignment, no Flow-5 format) belong here. Course
+ * (enrolled) exams never leak here even if they carry a category id.
  */
 export async function fetchPublishedPublicExams(
   categoryId?: string,
@@ -2028,7 +2061,10 @@ export async function fetchPublishedPublicExams(
     const params: unknown[] = [];
     // PUBLIC scope category listing — both public + practice kinds belong to
     // the Main Website (course/enrolled exams never leak here).
-    let where = `kind IN ('public','practice') AND status = 'published'`; // closed/draft stay hidden
+    let where = `kind IN ('public','practice') AND status = 'published'
+      AND COALESCE(archived, 0) = 0
+      AND chapter_id IS NULL AND exam_format IS NULL
+      AND NOT EXISTS (SELECT 1 FROM exam_courses ec WHERE ec.exam_id = exams.id)`; // closed/draft stay hidden
     if (categoryId && categoryId.trim()) {
       where += ` AND category_id = ?`;
       params.push(categoryId.trim());

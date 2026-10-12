@@ -56,8 +56,10 @@ function fixture() {
     CREATE TABLE exams (
       id TEXT PRIMARY KEY, category_id TEXT, kind TEXT DEFAULT 'public',
       exam_mode TEXT DEFAULT 'live', status TEXT DEFAULT 'published',
-      archived INTEGER DEFAULT 0, scheduled_at TEXT, ends_at TEXT
+      archived INTEGER DEFAULT 0, scheduled_at TEXT, ends_at TEXT,
+      chapter_id TEXT, exam_format TEXT
     );
+    CREATE TABLE exam_courses (exam_id TEXT, course_id TEXT, PRIMARY KEY (exam_id, course_id));
   `);
   let nowMs = NOW;
   let failDb = false;
@@ -113,21 +115,27 @@ function fixture() {
     archived?: number;
     scheduled_at?: string | null;
     ends_at?: string | null;
+    chapter_id?: string | null;
+    exam_format?: string | null;
   };
   const add = (id: string, overrides: Input = {}) => {
     const row = {
       id, category_id: "category-medical", kind: "public", exam_mode: "live",
       status: "published", archived: 0, scheduled_at: null, ends_at: null,
+      chapter_id: null, exam_format: null,
       ...overrides,
     };
     db.prepare(`INSERT INTO exams
-      (id, category_id, kind, exam_mode, status, archived, scheduled_at, ends_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(row.id, row.category_id, row.kind, row.exam_mode, row.status, row.archived, row.scheduled_at, row.ends_at);
+      (id, category_id, kind, exam_mode, status, archived, scheduled_at, ends_at, chapter_id, exam_format)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.id, row.category_id, row.kind, row.exam_mode, row.status, row.archived, row.scheduled_at, row.ends_at, row.chapter_id, row.exam_format);
     return row;
   };
+  const assignCourse = (examId: string, course = "some-course") => {
+    db.prepare(`INSERT INTO exam_courses (exam_id, course_id) VALUES (?, ?)`).run(examId, course);
+  };
   return {
-    db, add, server, route, cachedKeys,
+    db, add, assignCourse, server, route, cachedKeys,
     get queryCount() { return queryCount; },
     setTime: (value: number) => { nowMs = value; },
     fail: () => { failDb = true; },
@@ -207,6 +215,25 @@ describe("fresh public exam category counts", () => {
     }
     const result = await f.server.fetchPublicExamCounts();
     assert.deepEqual(plain(result), { counts: zeroCounts(), practiceCounts: zeroCounts() });
+  });
+
+  it("excludes course-linked exams from Free Exams even when their kind is public", async (t) => {
+    const f = fixture();
+    t.after(() => f.db.close());
+    f.add("free-live");
+    f.add("free-practice", { exam_mode: "practice" });
+    // Chapter-linked, Flow-5 format, and directly assigned exams belong to
+    // Course Content Control — never to Free Exams, regardless of kind.
+    f.add("chapter-linked", { chapter_id: "chapter-1" });
+    f.add("chapter-practice", { chapter_id: "chapter-1", exam_mode: "practice" });
+    f.add("flow-format", { exam_format: "topic-wise" });
+    f.add("assigned", {});
+    f.assignCourse("assigned");
+    f.add("assigned-practice", { exam_mode: "practice" });
+    f.assignCourse("assigned-practice");
+    const result = await f.server.fetchPublicExamCounts();
+    assert.equal(result.counts["medical-admission"], 1);
+    assert.equal(result.practiceCounts["medical-admission"], 1);
   });
 
   it("uses exact category IDs, not subject/batch heuristics or all similarly named categories", async (t) => {
