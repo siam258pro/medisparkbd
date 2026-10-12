@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import ExamCategoryCards, { type CategoryCardItem } from "@/components/ExamCategoryCards";
+import ExamCategoryCards from "@/components/ExamCategoryCards";
 import EnrolledExamCourseSelection from "@/components/EnrolledExamCourseSelection";
 
 type LandingTab = "free" | "enrolled";
@@ -15,17 +15,13 @@ const tabButtonClass = (active: boolean) =>
 
 /**
  * Main Website Exams navigation — two-segment structure:
- * "Free Exams" (default) keeps the existing public category cards;
- * "Courses Exams" hosts the existing enrolled-course exam flow.
- * Structural reorganization only — both systems are reused unchanged.
+ * "Free Exams" (default, temporarily showing no cards — display-only,
+ * Public Exam records untouched) and "Courses Exams" (enrolled-course
+ * exam flow, unchanged).
  */
 export default function ExamLandingTabs({
-  initialCategories,
   initialTab = "free",
 }: {
-  initialCategories?: CategoryCardItem[] | null;
-  initialCounts?: Record<string, number> | null;
-  initialPracticeCounts?: Record<string, number> | null;
   initialTab?: LandingTab;
 }) {
   const [tab, setTab] = useState<LandingTab>(initialTab);
@@ -63,7 +59,9 @@ export default function ExamLandingTabs({
 
       {tab === "free" ? (
         <div role="tabpanel" aria-label="Free Exams">
-          <ExamCategoryCards initialCategories={initialCategories} />
+          {/* Temporarily hidden (display-only): renders the empty state
+              without fetching. Public Exam records are untouched. */}
+          <ExamCategoryCards initialCategories={[]} disableFetch />
         </div>
       ) : (
         <div role="tabpanel" aria-label="Courses Exams">

@@ -82,11 +82,19 @@ function formatPracticeText(count: number): string {
 export default function ExamCategoryCards({
   basePath = "/exam/category",
   initialCategories,
+  disableFetch = false,
 }: {
   basePath?: string;
   initialCounts?: Record<string, number> | null;
   initialPracticeCounts?: Record<string, number> | null;
   initialCategories?: CategoryCardItem[] | null;
+  /**
+   * Temporary display-only flag: when true the component renders
+   * `initialCategories` as-is and never calls the category-cards API.
+   * Used only by the main website Free Exams section while it is
+   * intentionally hidden. No database records are affected.
+   */
+  disableFetch?: boolean;
 }) {
   const [categories, setCategories] = useState<CategoryCardItem[] | null>(
     initialCategories ?? null,
@@ -94,6 +102,7 @@ export default function ExamCategoryCards({
   const AUTO_REFRESH_MS = 60 * 1000;
 
   const load = useCallback(async () => {
+    if (disableFetch) return;
     try {
       const res = await fetch("/api/public-exams/category-cards", { cache: "no-store" });
       if (!res.ok) return;
@@ -102,7 +111,7 @@ export default function ExamCategoryCards({
     } catch {
       // Keep previous categories on error.
     }
-  }, []);
+  }, [disableFetch]);
 
   useEffect(() => {
     const initialLoad = window.setTimeout(() => void load(), 0);
